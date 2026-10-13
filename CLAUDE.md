@@ -21,8 +21,8 @@ ECS Fargate service in private subnets, image in ECR, least-privilege IAM.
 |---|---|---|
 | 1 | App (Flask) + Dockerfile + Terraform root layout & `terraform.tfvars` | ✅ Done – tested locally in Docker |
 | 2 | `network` module – VPC, subnets, IGW, route tables, VPC endpoints | ✅ Done – `validate` + `plan` clean (21 to add); not yet applied |
-| 3 | `ecr` module – image repository | ⏳ Next |
-| 4 | `iam` module – task execution role + task role | ⬜ |
+| 3 | `ecr` module – image repository | ✅ Done – `validate` + `plan` clean (23 to add total); not yet applied |
+| 4 | `iam` module – task execution role + task role | ⏳ Next |
 | 5 | `alb` module – ALB, target group, listener, SG | ⬜ |
 | 6 | `ecs` module – cluster, task definition, service, SG | ⬜ |
 
@@ -43,12 +43,10 @@ ECS Fargate service in private subnets, image in ECR, least-privilege IAM.
     ├── main.tf             # root module – wires child modules together
     ├── outputs.tf
     ├── .terraform.lock.hcl # provider version lock (committed)
-    └── modules/
-        └── network/        # VPC, subnets, IGW, route tables, VPC endpoints, SGs
-            ├── main.tf
-            ├── variables.tf
-            └── outputs.tf
-        # ecr, iam, alb, ecs added in later steps
+    └── modules/            # each module: main.tf, variables.tf, outputs.tf
+        ├── network/        # VPC, subnets, IGW, route tables, VPC endpoints, SGs
+        └── ecr/            # image repository + lifecycle policy
+        # iam, alb, ecs added in later steps
 ```
 
 ## Network layout (Step 2)
@@ -68,6 +66,24 @@ VPC 10.10.0.0/16  (DNS support + hostnames on)
 Module outputs: `vpc_id`, `vpc_cidr`, `public_subnet_ids`, `private_subnet_ids`,
 `private_subnet_cidrs`, `public_route_table_id`, `private_route_table_id`
 (Phase 2 peering route goes here), `vpc_endpoints_security_group_id`.
+
+## Container registry (Step 3)
+
+ECR repository `adom-demo-dev-app`: immutable tags, scan on push, AES256 encryption,
+lifecycle policy (untagged expire after 1 day, keep newest 10).
+Module outputs: `repository_name`, `repository_url`, `repository_arn`.
+
+### Push the image (after apply)
+
+```powershell
+cd terraform
+$REPO = terraform output -raw ecr_repository_url
+aws ecr get-login-password --region eu-central-1 | docker login --username AWS --password-stdin $REPO.Split('/')[0]
+docker build -t "${REPO}:v1.0.0" ../app
+docker push "${REPO}:v1.0.0"
+```
+
+Tags are immutable: bump `image_tag` in `terraform.tfvars` (e.g. `v1.0.1` or a git SHA) for every new build.
 
 ## The app
 
@@ -125,6 +141,16 @@ docker rm -f adom-demo-test
 - **`map_public_ip_on_launch = false`** everywhere; the ALB gets public IPs regardless.
 - **Cost:** 3 Interface endpoints × 2 AZs ≈ $0.06/hr (~$44/month). `terraform destroy` when not demoing.
 
+**Container registry (Step 3)**
+- **Immutable tags:** a tag always maps to the same image digest → reproducible deploys and exact
+  rollbacks; a running tag can't be silently overwritten (supply-chain safety). `image_tag`
+  validation rejects `"latest"`.
+- **Scan on push:** free basic CVE scan of OS packages on every push.
+- **AES256 encryption at rest** (AWS-managed, free); move to KMS for custom key policy / key-usage audit.
+- **Lifecycle policy:** bounded storage cost without manual cleanup.
+- **`force_delete` driven by tfvars:** `true` in dev so `destroy` works with images present; `false` for prod.
+- **No repository policy:** access via IAM; Step 4's execution role is scoped to this repo's ARN.
+
 ## Testing strategy
 
 | Level | What it proves |
@@ -146,7 +172,9 @@ docker rm -f adom-demo-test
 | `availability_zones` | `eu-central-1a`, `eu-central-1b` |
 | `public_subnet_cidrs` | `10.10.1.0/24`, `10.10.2.0/24` |
 | `private_subnet_cidrs` | `10.10.11.0/24`, `10.10.12.0/24` |
+| `ecr_force_delete` / `ecr_max_image_count` | `true` / `10` |
 | `container_port` | `8080` |
+| `image_tag` | `v1.0.0` (immutable – bump per build) |
 | `task_cpu` / `task_memory` | `256` / `512` |
 | `desired_count` | `2` (one task per AZ) |
 

@@ -23,3 +23,11 @@ module "network" {
   public_subnet_cidrs  = var.public_subnet_cidrs
   private_subnet_cidrs = var.private_subnet_cidrs
 }
+
+module "ecr" {
+  source = "./modules/ecr"
+
+  name_prefix     = local.name_prefix
+  force_delete    = var.ecr_force_delete
+  max_image_count = var.ecr_max_image_count
+}

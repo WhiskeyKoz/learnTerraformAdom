@@ -16,9 +16,13 @@ availability_zones   = ["eu-central-1a", "eu-central-1b"]
 public_subnet_cidrs  = ["10.10.1.0/24", "10.10.2.0/24"]
 private_subnet_cidrs = ["10.10.11.0/24", "10.10.12.0/24"]
 
+# Container registry (ECR)
+ecr_force_delete    = true # dev/demo only - lets `terraform destroy` remove a repo with images
+ecr_max_image_count = 10
+
 # Application / ECS
 container_port    = 8080
-image_tag         = "latest"
+image_tag         = "v1.0.0" # tags are immutable - bump for every new build
 task_cpu          = 256
 task_memory       = 512
 desired_count     = 2

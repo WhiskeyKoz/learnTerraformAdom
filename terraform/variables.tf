@@ -70,6 +70,21 @@ variable "private_subnet_cidrs" {
 }
 
 # ---------------------------------------------------------------------------
+# Container registry (ECR)
+# ---------------------------------------------------------------------------
+variable "ecr_force_delete" {
+  description = "Allow destroy to delete the ECR repo even if it contains images (true for dev/demo, false for prod)."
+  type        = bool
+  default     = false
+}
+
+variable "ecr_max_image_count" {
+  description = "Number of most recent images ECR keeps; older ones are expired."
+  type        = number
+  default     = 10
+}
+
+# ---------------------------------------------------------------------------
 # Application / ECS
 # ---------------------------------------------------------------------------
 variable "container_port" {
@@ -79,9 +94,15 @@ variable "container_port" {
 }
 
 variable "image_tag" {
-  description = "Tag of the image in ECR to deploy."
+  description = "Tag of the image in ECR to deploy (e.g. v1.0.0 or a git SHA)."
   type        = string
-  default     = "latest"
+
+  # Tags are immutable in ECR, so a moving tag like "latest" would make
+  # every push after the first one fail.
+  validation {
+    condition     = var.image_tag != "latest"
+    error_message = "Use a versioned tag (e.g. v1.0.0 or a git SHA), not \"latest\"."
+  }
 }
 
 variable "task_cpu" {
