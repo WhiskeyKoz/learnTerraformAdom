@@ -23,8 +23,9 @@ ECS Fargate service in private subnets, image in ECR, least-privilege IAM.
 | 2 | `network` module – VPC, subnets, IGW, route tables, VPC endpoints | ✅ Done – applied & verified |
 | 3 | `ecr` module – image repository | ✅ Done – applied, image pushed & scanned |
 | 4 | `iam` module + log group – task execution role + task role | ✅ Done – applied & verified (27 resources), then destroyed to save cost |
-| 5 | `alb` module – ALB, target group, listener, SG | ⏳ Next |
-| 6 | `ecs` module – cluster, task definition, service, SG | ⬜ |
+| 5 | `alb` module – ALB, target group, listener, SG | ✅ Written – `validate` + `plan` clean (40 to add total); not yet applied |
+| 6 | `ecs` module – cluster, task definition, service, SG | ✅ Written – `validate` + `plan` clean; not yet applied |
+| 7 | Full deploy + end-to-end test (ALB URL, AZ alternation, logs, negative tests) | ⏳ Next |
 
 ## Project structure
 
@@ -46,8 +47,19 @@ ECS Fargate service in private subnets, image in ECR, least-privilege IAM.
     └── modules/            # each module: main.tf, variables.tf, outputs.tf
         ├── network/        # VPC, subnets, IGW, route tables, VPC endpoints, SGs
         ├── ecr/            # image repository + lifecycle policy
-        └── iam/            # ECS task execution role + task role
-        # alb, ecs added in later steps
+        ├── iam/            # ECS task execution role + task role
+        ├── alb/            # public ALB, target group, HTTP listener, ALB SG
+        └── ecs/            # cluster, task definition, service, tasks SG
+```
+
+## Request flow (Steps 5–6)
+
+```
+Internet ──80──▶ ALB (public subnets, 1a+1b) ──8080──▶ ECS tasks (private subnets, 1a+1b)
+                 alb-sg: in 80 from alb_ingress_cidrs   tasks-sg: in 8080 ONLY from alb-sg
+                         out 8080 ONLY to tasks-sg               out 443 ONLY to VPC endpoints + S3
+                                                                        │
+                                              ECR (image) · S3 (layers) · CloudWatch (logs)
 ```
 
 ## Network layout (Step 2)
@@ -66,7 +78,7 @@ VPC 10.10.0.0/16  (DNS support + hostnames on)
 
 Module outputs: `vpc_id`, `vpc_cidr`, `public_subnet_ids`, `private_subnet_ids`,
 `private_subnet_cidrs`, `public_route_table_id`, `private_route_table_id`
-(Phase 2 peering route goes here), `vpc_endpoints_security_group_id`.
+(Phase 2 peering route goes here), `s3_prefix_list_id`, `vpc_endpoints_security_group_id`.
 
 ## Container registry (Step 3)
 
@@ -103,18 +115,39 @@ docker push "${REPO}:v1.0.0"
 Both roles trust only `ecs-tasks.amazonaws.com`, conditioned on `aws:SourceAccount` + `aws:SourceArn`
 (this account/region). Log group `/ecs/adom-demo-dev/app` (7-day retention) is created in the root module.
 
+## ALB (Step 5)
+
+Internet-facing ALB `adom-demo-dev-alb` in both public subnets; target group `adom-demo-dev-tg`
+(`target_type = ip`, HTTP 8080, health check `/health` every 15s, healthy 2 / unhealthy 3,
+deregistration delay 30s); HTTP 80 listener forwarding to it.
+Module outputs: `alb_dns_name`, `alb_arn`, `alb_security_group_id`, `target_group_arn`.
+
+## ECS (Step 6)
+
+- Cluster `adom-demo-dev-cluster` (Container Insights toggle, off by default).
+- Task definition `adom-demo-dev-app`: Fargate, `awsvpc`, X86_64, 0.25 vCPU / 512 MiB,
+  read-only root FS, all Linux capabilities dropped, `awslogs` → `/ecs/adom-demo-dev/app` (stream `ecs/app/<task-id>`),
+  env `APP_ENV`, `APP_NAME`.
+- Service `adom-demo-dev-app`: 2 tasks in private subnets, no public IP, registered in the target group,
+  rolling deploy 100%/200%, circuit breaker with rollback, `wait_for_steady_state = true`.
+- Module outputs: `cluster_name`, `service_name`, `task_definition_arn`, `tasks_security_group_id`.
+- Root outputs: `app_url`, `ecs_cluster_name`, `ecs_service_name`.
+
 ## Deploy from scratch (order matters)
 
-ECS can't run an image that isn't in ECR yet, so:
+ECS can't run an image that isn't in ECR yet, and `wait_for_steady_state = true` makes `apply`
+wait for healthy tasks – so a single `apply` from zero would hang and then fail. Use:
 
-1. `terraform apply` – creates network, empty ECR repo, IAM, log group (later: ALB + ECS).
-2. Build + push the image (commands above).
-3. After Steps 5–6 exist: `terraform apply` – ECS service starts tasks; the image is already there.
+```powershell
+cd terraform
+terraform apply -target=module.ecr   # 1. empty ECR repo only
+# 2. build + push the image (commands in "Push the image" above)
+terraform apply                      # 3. everything else; waits until 2 tasks are healthy
+terraform output app_url             # 4. open in browser
+```
 
-If ECS is created before the image exists, `apply` still succeeds (Terraform never checks the image),
-but tasks fail with `CannotPullContainerError` and ECS retries until the image is pushed.
-For a fresh environment in one go: `terraform apply -target=module.ecr`, push, then `terraform apply`.
-Real-world: ECR in a separate long-lived "foundation" stack; CI/CD pushes a tag then applies with `-var image_tag=...`.
+Real-world: ECR in a separate long-lived "foundation" stack; CI/CD pushes a tag then applies with
+`-var image_tag=...`. `-target` is only for this bootstrap, not routine use.
 
 ## The app
 
@@ -145,6 +178,8 @@ docker rm -f adom-demo-test
 - Dependencies copied before code for Docker layer caching.
 - Runs as non-root `appuser` (UID 10001) → port 8080, since non-root can't bind < 1024.
 - Gunicorn (production WSGI) instead of Flask dev server; logs to stdout → CloudWatch via `awslogs`.
+- `--worker-tmp-dir /dev/shm`: gunicorn heartbeat files go to tmpfs so the container runs with a
+  read-only root filesystem. Tested locally: `docker run --read-only --cap-drop ALL --security-opt no-new-privileges`.
 
 **Terraform**
 - All configuration lives in `terraform.tfvars`; `variables.tf` validates input so bad values fail at `plan`.
@@ -192,6 +227,24 @@ docker rm -f adom-demo-test
 - **Log group created by Terraform** (root module, shared by iam + ecs): fixed retention instead of
   never-expire, and no `logs:CreateLogGroup` needed at runtime.
 - **Inline policy (`aws_iam_role_policy`)**: lifecycle tied to the role, can't be attached elsewhere.
+
+**ALB + ECS (Steps 5–6)**
+- **SG-to-SG references, not CIDRs:** tasks accept traffic only from the ALB's SG – nothing else in
+  the VPC can reach them. The ALB SG's egress rule lives in the ecs module (it references the tasks SG).
+- **Egress locked down too:** tasks may only reach the VPC endpoints SG and the S3 prefix list on 443 –
+  a compromised app can't call the internet or move laterally. DNS and the task metadata endpoint are
+  link-local and not filtered by SGs.
+- **`target_type = "ip"`:** required for Fargate/`awsvpc` – each task has its own ENI + private IP.
+- **Container hardening layers:** non-root image + read-only root FS + `capabilities.drop = ["ALL"]`.
+- **Deployment safety:** rolling 100%/200% (no downtime), circuit breaker with auto-rollback,
+  `wait_for_steady_state` so `apply` fails if tasks never become healthy.
+- **`depends_on` on the `target_group_arn` output:** ECS rejects a service whose target group isn't
+  attached to an ALB yet; exposing the ARN only after the listener exists enforces the order.
+- **`drop_invalid_header_fields`:** ALB drops malformed headers (request-smuggling mitigation).
+- **Short deregistration delay (30s)** instead of the 300s default → faster deployments.
+- **HTTP only (demo):** HTTPS needs an ACM cert for an owned domain; prod = 443 listener + 80→443 redirect.
+- **`alb_ingress_cidrs` in tfvars:** `0.0.0.0/0` for a public demo, or `<your-ip>/32` to lock it down.
+- **Cost while running:** ALB + 2 × 0.25 vCPU tasks + endpoints ≈ $0.09/hr.
 
 ## Testing strategy
 
@@ -254,6 +307,8 @@ aws iam simulate-principal-policy --policy-source-arn <execution-role-arn> --act
 | `private_subnet_cidrs` | `10.10.11.0/24`, `10.10.12.0/24` |
 | `ecr_force_delete` / `ecr_max_image_count` | `true` / `10` |
 | `log_retention_days` | `7` |
+| `alb_ingress_cidrs` | `["0.0.0.0/0"]` (public demo) |
+| `enable_container_insights` | `false` |
 | `container_port` | `8080` |
 | `image_tag` | `v1.0.0` (immutable – bump per build) |
 | `task_cpu` / `task_memory` | `256` / `512` |

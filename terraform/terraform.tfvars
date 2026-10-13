@@ -30,3 +30,9 @@ task_cpu          = 256
 task_memory       = 512
 desired_count     = 2
 health_check_path = "/health"
+
+enable_container_insights = false # extra CloudWatch cost; enable when you need per-task metrics
+
+# Load balancer
+# 0.0.0.0/0 = public demo. To lock it to yourself: ["<your-public-ip>/32"]
+alb_ingress_cidrs = ["0.0.0.0/0"]

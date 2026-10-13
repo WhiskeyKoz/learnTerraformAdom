@@ -142,3 +142,22 @@ variable "health_check_path" {
   type        = string
   default     = "/health"
 }
+
+variable "enable_container_insights" {
+  description = "Enable CloudWatch Container Insights on the ECS cluster (extra cost)."
+  type        = bool
+  default     = false
+}
+
+# ---------------------------------------------------------------------------
+# Load balancer
+# ---------------------------------------------------------------------------
+variable "alb_ingress_cidrs" {
+  description = "CIDRs allowed to reach the public ALB on HTTP 80. Restrict to your own IP (x.x.x.x/32) for a private demo."
+  type        = list(string)
+
+  validation {
+    condition     = alltrue([for c in var.alb_ingress_cidrs : can(cidrhost(c, 0))])
+    error_message = "Every entry in alb_ingress_cidrs must be a valid IPv4 CIDR."
+  }
+}

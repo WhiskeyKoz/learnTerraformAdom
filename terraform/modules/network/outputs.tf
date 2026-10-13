@@ -33,6 +33,11 @@ output "private_route_table_id" {
   value       = aws_route_table.private.id
 }
 
+output "s3_prefix_list_id" {
+  description = "Managed prefix list of S3 (via the Gateway endpoint) - lets SGs allow egress to S3 only."
+  value       = aws_vpc_endpoint.s3.prefix_list_id
+}
+
 output "vpc_endpoints_security_group_id" {
   description = "Security group attached to the Interface VPC endpoints."
   value       = aws_security_group.vpc_endpoints.id

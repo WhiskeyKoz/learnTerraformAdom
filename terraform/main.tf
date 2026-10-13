@@ -1,11 +1,10 @@
 # ---------------------------------------------------------------------------
 # Root module: wires the child modules together.
-# Each module is added step by step:
-#   1. module "network" - VPC, subnets, IGW, route tables, VPC endpoints
-#   2. module "ecr"     - image repository
-#   3. module "iam"     - task execution role + task role
-#   4. module "alb"     - public ALB, target group, listener
-#   5. module "ecs"     - cluster, task definition, service
+#   module "network" - VPC, subnets, IGW, route tables, VPC endpoints
+#   module "ecr"     - image repository
+#   module "iam"     - task execution role + task role (+ app log group here)
+#   module "alb"     - public ALB, target group, listener
+#   module "ecs"     - cluster, task definition, service
 # ---------------------------------------------------------------------------
 
 locals {
@@ -51,4 +50,41 @@ module "iam" {
   aws_region         = var.aws_region
   ecr_repository_arn = module.ecr.repository_arn
   log_group_arn      = aws_cloudwatch_log_group.app.arn
+}
+
+module "alb" {
+  source = "./modules/alb"
+
+  name_prefix       = local.name_prefix
+  vpc_id            = module.network.vpc_id
+  public_subnet_ids = module.network.public_subnet_ids
+  ingress_cidrs     = var.alb_ingress_cidrs
+  container_port    = var.container_port
+  health_check_path = var.health_check_path
+}
+
+module "ecs" {
+  source = "./modules/ecs"
+
+  name_prefix = local.name_prefix
+  aws_region  = var.aws_region
+  environment = var.environment
+
+  vpc_id                          = module.network.vpc_id
+  private_subnet_ids              = module.network.private_subnet_ids
+  vpc_endpoints_security_group_id = module.network.vpc_endpoints_security_group_id
+  s3_prefix_list_id               = module.network.s3_prefix_list_id
+  alb_security_group_id           = module.alb.alb_security_group_id
+  target_group_arn                = module.alb.target_group_arn
+
+  container_image    = "${module.ecr.repository_url}:${var.image_tag}"
+  container_port     = var.container_port
+  task_cpu           = var.task_cpu
+  task_memory        = var.task_memory
+  execution_role_arn = module.iam.execution_role_arn
+  task_role_arn      = module.iam.task_role_arn
+  log_group_name     = aws_cloudwatch_log_group.app.name
+
+  desired_count             = var.desired_count
+  enable_container_insights = var.enable_container_insights
 }

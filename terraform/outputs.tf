@@ -40,3 +40,19 @@ output "ecs_task_role_arn" {
   description = "ECS task role (app runtime identity)."
   value       = module.iam.task_role_arn
 }
+
+# --- ALB / ECS -------------------------------------------------------------
+output "app_url" {
+  description = "Open this in a browser - refresh to see requests hit tasks in both AZs."
+  value       = "http://${module.alb.alb_dns_name}"
+}
+
+output "ecs_cluster_name" {
+  description = "ECS cluster name."
+  value       = module.ecs.cluster_name
+}
+
+output "ecs_service_name" {
+  description = "ECS service name."
+  value       = module.ecs.service_name
+}

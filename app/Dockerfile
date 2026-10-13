@@ -23,4 +23,6 @@ USER appuser
 EXPOSE 8080
 
 # Gunicorn is a production WSGI server; Flask's built-in server is dev-only.
-CMD ["sh", "-c", "exec gunicorn --bind 0.0.0.0:${PORT} --workers 2 --access-logfile - app:app"]
+# --worker-tmp-dir /dev/shm: worker heartbeat files go to in-memory tmpfs, so the
+# container works with a read-only root filesystem (set in the ECS task definition).
+CMD ["sh", "-c", "exec gunicorn --bind 0.0.0.0:${PORT} --workers 2 --worker-tmp-dir /dev/shm --access-logfile - app:app"]
