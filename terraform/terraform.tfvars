@@ -35,4 +35,5 @@ enable_container_insights = false # extra CloudWatch cost; enable when you need 
 
 # Load balancer
 # 0.0.0.0/0 = public demo. To lock it to yourself: ["<your-public-ip>/32"]
+# (find it with: curl https://checkip.amazonaws.com)
 alb_ingress_cidrs = ["0.0.0.0/0"]

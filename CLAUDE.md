@@ -9,11 +9,13 @@ secure a containerized AWS environment with Terraform.
 - **VPC B – Internal services:** private, isolated ECS Fargate backend/API with no internet access.
 - **Inter-VPC:** VPC Peering with strict Security Group rules.
 
-## Current scope: Phase 1 (MVP)
+## Phase 1 (MVP) – ✅ COMPLETE (2026-10-13)
 
 Single VPC: 2 public + 2 private subnets across 2 AZs, ALB in public subnets,
 ECS Fargate service in private subnets, image in ECR, least-privilege IAM.
-**Phase 2 (multi-VPC / peering) is out of scope until Phase 1 is complete.**
+Deployed and verified end to end (40 resources), then destroyed to save cost.
+
+**Next: Phase 2** – multi-VPC (VPC B internal backend) + VPC peering. Not started.
 
 ## Progress
 
@@ -22,16 +24,18 @@ ECS Fargate service in private subnets, image in ECR, least-privilege IAM.
 | 1 | App (Flask) + Dockerfile + Terraform root layout & `terraform.tfvars` | ✅ Done – tested locally in Docker |
 | 2 | `network` module – VPC, subnets, IGW, route tables, VPC endpoints | ✅ Done – applied & verified |
 | 3 | `ecr` module – image repository | ✅ Done – applied, image pushed & scanned |
-| 4 | `iam` module + log group – task execution role + task role | ✅ Done – applied & verified (27 resources), then destroyed to save cost |
-| 5 | `alb` module – ALB, target group, listener, SG | ✅ Written – `validate` + `plan` clean (40 to add total); not yet applied |
-| 6 | `ecs` module – cluster, task definition, service, SG | ✅ Written – `validate` + `plan` clean; not yet applied |
-| 7 | Full deploy + end-to-end test (ALB URL, AZ alternation, logs, negative tests) | ⏳ Next |
+| 4 | `iam` module + log group – task execution role + task role | ✅ Done – applied & verified |
+| 5 | `alb` module – ALB, target group, listener, SG | ✅ Done – applied & verified |
+| 6 | `ecs` module – cluster, task definition, service, SG | ✅ Done – applied & verified |
+| 7 | Full deploy + end-to-end test (ALB URL, AZ alternation, logs, negative tests, drift) | ✅ Done – all passed (see "End-to-end results") |
 
 ## Project structure
 
 ```
 .
 ├── CLAUDE.md
+├── tests/
+│   └── egress-test.json    # one-off ECS task override: proves tasks cannot reach the internet
 ├── app/
 │   ├── app.py              # Flask app: shows hostname, IP, ECS task ID & AZ
 │   ├── requirements.txt    # flask, gunicorn (pinned)
@@ -140,11 +144,16 @@ wait for healthy tasks – so a single `apply` from zero would hang and then fai
 
 ```powershell
 cd terraform
-terraform apply -target=module.ecr   # 1. empty ECR repo only
+terraform apply "-target=module.ecr" # 1. empty ECR repo only (quote it: PowerShell splits on the dot)
 # 2. build + push the image (commands in "Push the image" above)
-terraform apply                      # 3. everything else; waits until 2 tasks are healthy
-terraform output app_url             # 4. open in browser
+terraform apply                      # 3. everything else; waits until 2 tasks are healthy (~4 min)
+terraform output app_url             # 4. open in browser - type http:// explicitly
+terraform plan                       # 5. must say "No changes" (drift check)
+terraform destroy                    # when done (~4 min)
 ```
+
+**Browser tip:** Chrome/Edge may auto-upgrade to `https://`, which times out (no 443 listener).
+Type the URL with `http://` explicitly.
 
 Real-world: ECR in a separate long-lived "foundation" stack; CI/CD pushes a tag then applies with
 `-var image_tag=...`. `-target` is only for this bootstrap, not routine use.
@@ -245,6 +254,10 @@ docker rm -f adom-demo-test
 - **HTTP only (demo):** HTTPS needs an ACM cert for an owned domain; prod = 443 listener + 80→443 redirect.
 - **`alb_ingress_cidrs` in tfvars:** `0.0.0.0/0` for a public demo, or `<your-ip>/32` to lock it down.
 - **Cost while running:** ALB + 2 × 0.25 vCPU tasks + endpoints ≈ $0.09/hr.
+- **Explicit defaults in `container_definitions`** (`hostPort`, empty `mountPoints` / `volumesFrom` /
+  `systemControls`, `capabilities.add = []`): AWS fills these in, so without them every `plan` showed
+  a diff and would replace the task definition + redeploy the service (perpetual drift). Found by
+  running `plan` right after `apply`.
 
 ## Testing strategy
 
@@ -271,8 +284,36 @@ docker rm -f adom-demo-test
 | 8 | Log group | `/ecs/adom-demo-dev/app`, retention 7 days |
 
 Note: the IAM policy simulator cannot evaluate `logs:PutLogEvents` against log-stream ARNs (it returns
-`implicitDeny` even for `Resource: "*"`), so log write permission is proven end-to-end in Step 6
-(container logs appear in CloudWatch).
+`implicitDeny` even for `Resource: "*"`). Log write permission was proven end-to-end in Step 7
+(container logs appeared in CloudWatch).
+
+### End-to-end results (Step 7, all passed on 2026-10-13)
+
+| # | Test | Result |
+|---|---|---|
+| 1 | Bootstrap order (ECR → push → apply) | 40 resources; service steady/healthy 67s after creation |
+| 2 | ALB `/health` + `/` | `{"status":"ok"}`, HTTP 200 |
+| 3 | Multi-AZ load balancing (20 requests) | 10 → `eu-central-1a` (10.10.11.246), 10 → `eu-central-1b` (10.10.12.81) |
+| 4 | Target group health | both targets `healthy` |
+| 5 | ECS service | running 2/2, rollout `COMPLETED` |
+| 6 | Task ENIs | no public IP on either task |
+| 7 | CloudWatch logs | one stream per task; gunicorn + `ELB-HealthChecker` lines (from ALB node in public subnet) |
+| 8 | Image pull via endpoints | tasks started with no internet route → ECR/S3 endpoints work |
+| 9 | **Negative:** task → internet | `example.com`, `google.com`: BLOCKED ("Network is unreachable") |
+| 10 | Positive control: task → ECR | `api.ecr...` resolves to private IP `10.10.12.239` (endpoint DNS), REACHABLE |
+| 11 | Drift check (`plan` after `apply`) | initially found perpetual task-def diff → fixed → "No changes" |
+| 12 | `alb_ingress_cidrs` change | switching to `<ip>/32` and back replaced only the one SG rule |
+
+**How the negative test works – one-off task with a command override** (same task def, subnets, SG
+as the service; prints results to CloudWatch, then exits):
+
+```bash
+aws ecs run-task --cluster adom-demo-dev-cluster --task-definition adom-demo-dev-app --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[<private-subnet-ids>],securityGroups=[<tasks-sg>],assignPublicIp=DISABLED}" \
+  --overrides file://tests/egress-test.json   # python script trying internet + ECR URLs
+aws ecs wait tasks-stopped --cluster adom-demo-dev-cluster --tasks <task-arn>
+aws logs get-log-events --log-group-name /ecs/adom-demo-dev/app --log-stream-name ecs/app/<task-id>
+```
 
 **Console checks (eu-central-1):** VPC → Resource map; Route tables → private RT has no `0.0.0.0/0`;
 Endpoints → 4 Available; ECR → image + scan findings; IAM → roles; CloudWatch → Log groups.
@@ -292,8 +333,12 @@ aws iam simulate-principal-policy --policy-source-arn <execution-role-arn> --act
 - **Base image CVEs:** scan of `python:3.12-slim` found 3 HIGH (zlib CVE-2026-85091, glibc
   CVE-2026-5435, CVE-2026-19499), 9 MEDIUM, 3 LOW – all in OS packages, not app code. Fix by
   rebuilding once Debian ships patches, or add `apt-get upgrade` in the Dockerfile.
-- **Environment is currently destroyed** (cost saving). Re-apply + re-push the image before testing
-  (`ecr_force_delete = true` deleted the image with the repo).
+- **Environment is currently destroyed** (cost saving). Follow "Deploy from scratch" to recreate
+  (`ecr_force_delete = true` deleted the image with the repo, so it must be pushed again).
+- **HTTPS:** HTTP-only for the demo. Production: ACM certificate + 443 listener + 80→443 redirect.
+- **Possible hardening later:** ALB access logs to S3, VPC Flow Logs, WAF on the ALB, ECS Exec
+  (needs `ssmmessages` endpoint + task role permissions), remote state backend (S3 + lockfile).
+- Old ECS task definition revisions stay as `INACTIVE` after destroy (no cost).
 
 ## Configuration (`terraform/terraform.tfvars`)
 
@@ -323,6 +368,8 @@ aws iam simulate-principal-policy --policy-source-arn <execution-role-arn> --act
   `$env:Path = [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [Environment]::GetEnvironmentVariable("Path","User")`
 - Prerequisites: Docker Desktop, Terraform >= 1.6 (`winget install Hashicorp.Terraform`), AWS CLI with credentials.
 - Never `terraform apply`/`destroy` without explicit approval – it creates real, billable resources.
+- After every `apply`, run `terraform plan` and expect "No changes" (catches perpetual drift).
+- PowerShell: quote args containing dots, e.g. `terraform apply "-target=module.ecr"`.
 
 ## Common commands
 

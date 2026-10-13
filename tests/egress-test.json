@@ -1,0 +1,11 @@
+{
+  "containerOverrides": [
+    {
+      "name": "app",
+      "command": [
+        "python", "-c",
+        "import socket, urllib.request, urllib.error\nprint('EGRESS-TEST start', flush=True)\nfor host in ['example.com', 'api.ecr.eu-central-1.amazonaws.com']:\n    try:\n        print('DNS', host, '->', socket.gethostbyname(host), flush=True)\n    except Exception as e:\n        print('DNS', host, 'FAILED', e, flush=True)\nfor url in ['https://example.com', 'https://www.google.com', 'https://api.ecr.eu-central-1.amazonaws.com']:\n    try:\n        urllib.request.urlopen(url, timeout=5)\n        print('REACHABLE', url, flush=True)\n    except urllib.error.HTTPError as e:\n        print('REACHABLE', url, '(HTTP', e.code, ')', flush=True)\n    except Exception as e:\n        print('BLOCKED  ', url, type(e).__name__, e, flush=True)\nprint('EGRESS-TEST end', flush=True)\n"
+      ]
+    }
+  ]
+}

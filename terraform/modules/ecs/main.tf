@@ -99,6 +99,10 @@ resource "aws_ecs_task_definition" "app" {
     cpu_architecture        = "X86_64" # must match the image (built with --platform linux/amd64)
   }
 
+  # NOTE: fields AWS would otherwise fill with defaults (hostPort, empty
+  # mountPoints/volumesFrom/systemControls, capabilities.add) are set
+  # explicitly. Without them every `plan` sees a diff and replaces the task
+  # definition (perpetual drift).
   container_definitions = jsonencode([
     {
       name      = local.container_name
@@ -107,8 +111,13 @@ resource "aws_ecs_task_definition" "app" {
 
       portMappings = [{
         containerPort = var.container_port
+        hostPort      = var.container_port # awsvpc: always equals containerPort
         protocol      = "tcp"
       }]
+
+      mountPoints    = []
+      volumesFrom    = []
+      systemControls = []
 
       environment = [
         { name = "APP_ENV", value = var.environment },
@@ -118,7 +127,7 @@ resource "aws_ecs_task_definition" "app" {
       # Container hardening (defense in depth - the image already runs as non-root):
       readonlyRootFilesystem = true # an attacker can't modify binaries/code on disk
       linuxParameters = {
-        capabilities = { drop = ["ALL"] } # app needs no Linux capabilities (port 8080 > 1024)
+        capabilities = { add = [], drop = ["ALL"] } # app needs no Linux capabilities (port 8080 > 1024)
       }
 
       logConfiguration = {
