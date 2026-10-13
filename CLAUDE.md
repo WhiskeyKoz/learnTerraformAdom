@@ -20,8 +20,8 @@ ECS Fargate service in private subnets, image in ECR, least-privilege IAM.
 | Step | What | Status |
 |---|---|---|
 | 1 | App (Flask) + Dockerfile + Terraform root layout & `terraform.tfvars` | ✅ Done – tested locally in Docker |
-| 2 | `network` module – VPC, subnets, IGW, route tables, VPC endpoints | ⏳ Next |
-| 3 | `ecr` module – image repository | ⬜ |
+| 2 | `network` module – VPC, subnets, IGW, route tables, VPC endpoints | ✅ Done – `validate` + `plan` clean (21 to add); not yet applied |
+| 3 | `ecr` module – image repository | ⏳ Next |
 | 4 | `iam` module – task execution role + task role | ⬜ |
 | 5 | `alb` module – ALB, target group, listener, SG | ⬜ |
 | 6 | `ecs` module – cluster, task definition, service, SG | ⬜ |
@@ -42,8 +42,32 @@ ECS Fargate service in private subnets, image in ECR, least-privilege IAM.
     ├── terraform.tfvars    # ALL environment-specific values (committed, no secrets)
     ├── main.tf             # root module – wires child modules together
     ├── outputs.tf
-    └── modules/            # network, ecr, iam, alb, ecs (added step by step)
+    ├── .terraform.lock.hcl # provider version lock (committed)
+    └── modules/
+        └── network/        # VPC, subnets, IGW, route tables, VPC endpoints, SGs
+            ├── main.tf
+            ├── variables.tf
+            └── outputs.tf
+        # ecr, iam, alb, ecs added in later steps
 ```
+
+## Network layout (Step 2)
+
+```
+VPC 10.10.0.0/16  (DNS support + hostnames on)
+├── IGW
+├── eu-central-1a: public 10.10.1.0/24  | private 10.10.11.0/24
+├── eu-central-1b: public 10.10.2.0/24  | private 10.10.12.0/24
+├── public-rt  : 0.0.0.0/0 -> IGW         (public subnets)
+├── private-rt : local + S3 endpoint only  (private subnets - no internet route)
+├── VPC endpoints: s3 (Gateway), ecr.api, ecr.dkr, logs (Interface, both AZs)
+├── vpce-sg    : 443 in from private subnet CIDRs only
+└── default SG locked down (no rules)
+```
+
+Module outputs: `vpc_id`, `vpc_cidr`, `public_subnet_ids`, `private_subnet_ids`,
+`private_subnet_cidrs`, `public_route_table_id`, `private_route_table_id`
+(Phase 2 peering route goes here), `vpc_endpoints_security_group_id`.
 
 ## The app
 
@@ -84,9 +108,33 @@ docker rm -f adom-demo-test
 - `terraform.tfvars` and `.terraform.lock.hcl` are committed; state files are git-ignored.
   Secrets never go in tfvars (use SSM Parameter Store / Secrets Manager).
 
-**Planned (Step 2)**
-- Private-subnet tasks reach ECR/CloudWatch through **VPC endpoints** (ECR api/dkr, S3 gateway, Logs)
-  rather than a NAT Gateway: no internet route at all, and the same pattern VPC B needs in Phase 2.
+- AWS provider pinned to `~> 6.0` (lock file currently resolves v6.68.0); Terraform `>= 1.6`.
+
+**Network (Step 2)**
+- **VPC endpoints instead of NAT Gateway:** private subnets have no internet route at all; tasks
+  reach ECR/CloudWatch via endpoints. Smaller attack surface, no exfiltration path, and the same
+  pattern VPC B needs in Phase 2.
+- **S3 Gateway endpoint** (free) is required because ECR stores image layers in S3. Its policy
+  allows only `s3:GetObject` on ECR's layer bucket (`prod-<region>-starport-layer-bucket`).
+- **Endpoint SG** allows only HTTPS 443 from the private subnet CIDRs; uses the newer
+  `aws_vpc_security_group_ingress_rule` resource (one rule per subnet) instead of inline rules.
+- **Default SG locked down** (CIS benchmark): resources launched without an explicit SG get no access.
+- **`for_each` keyed by AZ name, not `count`:** adding/removing an AZ doesn't shift indexes and
+  force-recreate the other subnets.
+- **Single private route table:** with no NAT there's no per-AZ next hop, so one table suffices.
+- **`map_public_ip_on_launch = false`** everywhere; the ALB gets public IPs regardless.
+- **Cost:** 3 Interface endpoints × 2 AZs ≈ $0.06/hr (~$44/month). `terraform destroy` when not demoing.
+
+## Testing strategy
+
+| Level | What it proves |
+|---|---|
+| `terraform validate` / `plan` | Syntax, references, provider schema, variable validation, read access to AWS, intended changes |
+| Apply + inspect (AWS CLI) | AWS accepts it: endpoints `available`, subnets/AZs, routes, SG rules |
+| End-to-end (after Step 6) | Browser → ALB → private task; AZ alternates; image pull proves endpoints; logs in CloudWatch |
+| Negative tests (after Step 6) | Tasks cannot reach the internet; tasks unreachable except via ALB |
+
+`plan` does NOT catch quotas, IAM permission gaps, CIDR conflicts, or runtime behavior (DNS, pulls).
 
 ## Configuration (`terraform/terraform.tfvars`)
 
@@ -106,5 +154,18 @@ docker rm -f adom-demo-test
 
 - Build step by step; explain each architectural decision (interview prep).
 - Before moving to the next step, ask whether to update this file; only update it when told to.
-- On this Windows machine Docker is on the PowerShell PATH, not Git Bash – run Docker via PowerShell.
+- On this Windows machine Docker and Terraform are on the PowerShell PATH, not Git Bash – run them via PowerShell.
 - Prerequisites: Docker Desktop, Terraform >= 1.6 (`winget install Hashicorp.Terraform`), AWS CLI with credentials.
+- Never `terraform apply`/`destroy` without explicit approval – it creates real, billable resources.
+
+## Common commands
+
+```powershell
+cd terraform
+terraform fmt -recursive
+terraform init
+terraform validate
+terraform plan
+terraform apply      # only with approval
+terraform destroy    # tear down when not demoing
+```
