@@ -20,10 +20,10 @@ ECS Fargate service in private subnets, image in ECR, least-privilege IAM.
 | Step | What | Status |
 |---|---|---|
 | 1 | App (Flask) + Dockerfile + Terraform root layout & `terraform.tfvars` | ✅ Done – tested locally in Docker |
-| 2 | `network` module – VPC, subnets, IGW, route tables, VPC endpoints | ✅ Done – `validate` + `plan` clean (21 to add); not yet applied |
-| 3 | `ecr` module – image repository | ✅ Done – `validate` + `plan` clean (23 to add total); not yet applied |
-| 4 | `iam` module – task execution role + task role | ⏳ Next |
-| 5 | `alb` module – ALB, target group, listener, SG | ⬜ |
+| 2 | `network` module – VPC, subnets, IGW, route tables, VPC endpoints | ✅ Done – applied & verified |
+| 3 | `ecr` module – image repository | ✅ Done – applied, image pushed & scanned |
+| 4 | `iam` module + log group – task execution role + task role | ✅ Done – applied & verified (27 resources), then destroyed to save cost |
+| 5 | `alb` module – ALB, target group, listener, SG | ⏳ Next |
 | 6 | `ecs` module – cluster, task definition, service, SG | ⬜ |
 
 ## Project structure
@@ -40,13 +40,14 @@ ECS Fargate service in private subnets, image in ECR, least-privilege IAM.
     ├── providers.tf        # Terraform/provider version pins, default_tags, S3 backend (commented)
     ├── variables.tf        # typed + validated input variables
     ├── terraform.tfvars    # ALL environment-specific values (committed, no secrets)
-    ├── main.tf             # root module – wires child modules together
+    ├── main.tf             # root module – wires modules together + app CloudWatch log group
     ├── outputs.tf
     ├── .terraform.lock.hcl # provider version lock (committed)
     └── modules/            # each module: main.tf, variables.tf, outputs.tf
         ├── network/        # VPC, subnets, IGW, route tables, VPC endpoints, SGs
-        └── ecr/            # image repository + lifecycle policy
-        # iam, alb, ecs added in later steps
+        ├── ecr/            # image repository + lifecycle policy
+        └── iam/            # ECS task execution role + task role
+        # alb, ecs added in later steps
 ```
 
 ## Network layout (Step 2)
@@ -78,12 +79,42 @@ Module outputs: `repository_name`, `repository_url`, `repository_arn`.
 ```powershell
 cd terraform
 $REPO = terraform output -raw ecr_repository_url
-aws ecr get-login-password --region eu-central-1 | docker login --username AWS --password-stdin $REPO.Split('/')[0]
-docker build -t "${REPO}:v1.0.0" ../app
+$REGISTRY = $REPO.Split('/')[0]
+# Pipe through cmd: PowerShell 5.1 re-encodes piped text and corrupts the token (-> 400 Bad Request)
+cmd /c "aws ecr get-login-password --region eu-central-1 | docker login --username AWS --password-stdin $REGISTRY"
+docker build --platform linux/amd64 --provenance=false --sbom=false -t "${REPO}:v1.0.0" ../app
 docker push "${REPO}:v1.0.0"
 ```
 
-Tags are immutable: bump `image_tag` in `terraform.tfvars` (e.g. `v1.0.1` or a git SHA) for every new build.
+- `--platform linux/amd64`: Fargate's default CPU architecture.
+- `--provenance=false --sbom=false` (**required**): otherwise Docker Desktop pushes an OCI *image index*
+  whose real image manifest is **untagged** – the lifecycle rule "expire untagged after 1 day" would
+  then delete the actual image and break `v1.0.0`, and ECR basic scanning doesn't scan indexes.
+- Tags are immutable: bump `image_tag` in `terraform.tfvars` (e.g. `v1.0.1` or a git SHA) for every new build.
+- `describe-images` scan summary can lag; use `aws ecr describe-image-scan-findings` for results.
+
+## IAM (Step 4)
+
+| Role | Used by | Permissions |
+|---|---|---|
+| `adom-demo-dev-ecs-execution-role` | ECS agent / Fargate | `ecr:GetAuthorizationToken` (`*`), pull from **this repo only**, create stream / put logs in **this log group only** |
+| `adom-demo-dev-ecs-task-role` | App code in the container | **None** (app calls no AWS APIs) |
+
+Both roles trust only `ecs-tasks.amazonaws.com`, conditioned on `aws:SourceAccount` + `aws:SourceArn`
+(this account/region). Log group `/ecs/adom-demo-dev/app` (7-day retention) is created in the root module.
+
+## Deploy from scratch (order matters)
+
+ECS can't run an image that isn't in ECR yet, so:
+
+1. `terraform apply` – creates network, empty ECR repo, IAM, log group (later: ALB + ECS).
+2. Build + push the image (commands above).
+3. After Steps 5–6 exist: `terraform apply` – ECS service starts tasks; the image is already there.
+
+If ECS is created before the image exists, `apply` still succeeds (Terraform never checks the image),
+but tasks fail with `CannotPullContainerError` and ECS retries until the image is pushed.
+For a fresh environment in one go: `terraform apply -target=module.ecr`, push, then `terraform apply`.
+Real-world: ECR in a separate long-lived "foundation" stack; CI/CD pushes a tag then applies with `-var image_tag=...`.
 
 ## The app
 
@@ -151,6 +182,17 @@ docker rm -f adom-demo-test
 - **`force_delete` driven by tfvars:** `true` in dev so `destroy` works with images present; `false` for prod.
 - **No repository policy:** access via IAM; Step 4's execution role is scoped to this repo's ARN.
 
+**IAM (Step 4)**
+- **Two roles, separated:** execution role = ECS agent (pull image, ship logs); task role = app code.
+  A compromised container only gets the task role's credentials – which have no permissions.
+- **Custom policy instead of `AmazonECSTaskExecutionRolePolicy`:** the managed policy allows pulling
+  from *any* repo and writing to *any* log group; ours is scoped to one repo ARN and one log group.
+  Only `ecr:GetAuthorizationToken` uses `*` (AWS doesn't support resource-scoping it).
+- **Confused-deputy protection:** trust policy conditions on `aws:SourceAccount` and `aws:SourceArn`.
+- **Log group created by Terraform** (root module, shared by iam + ecs): fixed retention instead of
+  never-expire, and no `logs:CreateLogGroup` needed at runtime.
+- **Inline policy (`aws_iam_role_policy`)**: lifecycle tied to the role, can't be attached elsewhere.
+
 ## Testing strategy
 
 | Level | What it proves |
@@ -161,6 +203,44 @@ docker rm -f adom-demo-test
 | Negative tests (after Step 6) | Tasks cannot reach the internet; tasks unreachable except via ALB |
 
 `plan` does NOT catch quotas, IAM permission gaps, CIDR conflicts, or runtime behavior (DNS, pulls).
+
+### Verification checklist (Steps 2–4, all passed on 2026-10-13)
+
+| # | Check | Expected |
+|---|---|---|
+| 1 | VPC endpoints | `s3` Gateway + `ecr.api`, `ecr.dkr`, `logs` Interface in 2 subnets, private DNS on, all `available` |
+| 2 | Subnets | public + private in each of 1a/1b, correct CIDRs, `MapPublicIpOnLaunch = False` |
+| 3 | Route tables | public: `0.0.0.0/0 -> igw`; private: `local` + S3 prefix list only (**no** `0.0.0.0/0`) |
+| 4 | Security groups | vpce-sg: tcp/443 from `10.10.11.0/24` + `10.10.12.0/24`, no egress; default SG: no rules |
+| 5 | ECR | `v1.0.0` is a single image manifest, scan `COMPLETE` |
+| 6 | IAM simulation (execution role) | pull **our** repo: allowed; other repo / `ecr:PutImage` / `s3:GetObject`: denied |
+| 7 | Task role | 0 inline + 0 attached policies |
+| 8 | Log group | `/ecs/adom-demo-dev/app`, retention 7 days |
+
+Note: the IAM policy simulator cannot evaluate `logs:PutLogEvents` against log-stream ARNs (it returns
+`implicitDeny` even for `Resource: "*"`), so log write permission is proven end-to-end in Step 6
+(container logs appear in CloudWatch).
+
+**Console checks (eu-central-1):** VPC → Resource map; Route tables → private RT has no `0.0.0.0/0`;
+Endpoints → 4 Available; ECR → image + scan findings; IAM → roles; CloudWatch → Log groups.
+
+**CLI:**
+```powershell
+cd terraform
+terraform output
+terraform plan   # "No changes" = no drift between code and AWS
+aws ec2 describe-vpc-endpoints --region eu-central-1 --filters Name=tag:Project,Values=adom-demo --query "VpcEndpoints[].[ServiceName,State]" --output table
+aws ecr describe-image-scan-findings --region eu-central-1 --repository-name adom-demo-dev-app --image-id imageTag=v1.0.0 --query "imageScanFindings.findingSeverityCounts"
+aws iam simulate-principal-policy --policy-source-arn <execution-role-arn> --action-names ecr:BatchGetImage --resource-arns <repo-arn>
+```
+
+## Known issues / follow-ups
+
+- **Base image CVEs:** scan of `python:3.12-slim` found 3 HIGH (zlib CVE-2026-85091, glibc
+  CVE-2026-5435, CVE-2026-19499), 9 MEDIUM, 3 LOW – all in OS packages, not app code. Fix by
+  rebuilding once Debian ships patches, or add `apt-get upgrade` in the Dockerfile.
+- **Environment is currently destroyed** (cost saving). Re-apply + re-push the image before testing
+  (`ecr_force_delete = true` deleted the image with the repo).
 
 ## Configuration (`terraform/terraform.tfvars`)
 
@@ -173,6 +253,7 @@ docker rm -f adom-demo-test
 | `public_subnet_cidrs` | `10.10.1.0/24`, `10.10.2.0/24` |
 | `private_subnet_cidrs` | `10.10.11.0/24`, `10.10.12.0/24` |
 | `ecr_force_delete` / `ecr_max_image_count` | `true` / `10` |
+| `log_retention_days` | `7` |
 | `container_port` | `8080` |
 | `image_tag` | `v1.0.0` (immutable – bump per build) |
 | `task_cpu` / `task_memory` | `256` / `512` |
@@ -183,6 +264,8 @@ docker rm -f adom-demo-test
 - Build step by step; explain each architectural decision (interview prep).
 - Before moving to the next step, ask whether to update this file; only update it when told to.
 - On this Windows machine Docker and Terraform are on the PowerShell PATH, not Git Bash – run them via PowerShell.
+- In a fresh PowerShell, refresh PATH first if `terraform` isn't found:
+  `$env:Path = [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [Environment]::GetEnvironmentVariable("Path","User")`
 - Prerequisites: Docker Desktop, Terraform >= 1.6 (`winget install Hashicorp.Terraform`), AWS CLI with credentials.
 - Never `terraform apply`/`destroy` without explicit approval – it creates real, billable resources.
 

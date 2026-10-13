@@ -24,3 +24,19 @@ output "ecr_repository_url" {
   description = "Push the app image here: docker push <url>:<image_tag>"
   value       = module.ecr.repository_url
 }
+
+# --- Logging / IAM ---------------------------------------------------------
+output "log_group_name" {
+  description = "CloudWatch log group for the app containers."
+  value       = aws_cloudwatch_log_group.app.name
+}
+
+output "ecs_execution_role_arn" {
+  description = "ECS task execution role (image pull + logs)."
+  value       = module.iam.execution_role_arn
+}
+
+output "ecs_task_role_arn" {
+  description = "ECS task role (app runtime identity)."
+  value       = module.iam.task_role_arn
+}

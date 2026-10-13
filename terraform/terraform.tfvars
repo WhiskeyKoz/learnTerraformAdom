@@ -20,6 +20,9 @@ private_subnet_cidrs = ["10.10.11.0/24", "10.10.12.0/24"]
 ecr_force_delete    = true # dev/demo only - lets `terraform destroy` remove a repo with images
 ecr_max_image_count = 10
 
+# Logging
+log_retention_days = 7
+
 # Application / ECS
 container_port    = 8080
 image_tag         = "v1.0.0" # tags are immutable - bump for every new build
