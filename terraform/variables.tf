@@ -1,0 +1,109 @@
+# ---------------------------------------------------------------------------
+# General
+# ---------------------------------------------------------------------------
+variable "aws_region" {
+  description = "AWS region to deploy into."
+  type        = string
+}
+
+variable "project_name" {
+  description = "Short project name, used as a prefix for resource names."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[a-z0-9-]{3,20}$", var.project_name))
+    error_message = "project_name must be 3-20 chars: lowercase letters, digits, hyphens."
+  }
+}
+
+variable "environment" {
+  description = "Deployment environment (dev, staging, prod)."
+  type        = string
+
+  validation {
+    condition     = contains(["dev", "staging", "prod"], var.environment)
+    error_message = "environment must be one of: dev, staging, prod."
+  }
+}
+
+# ---------------------------------------------------------------------------
+# Networking
+# ---------------------------------------------------------------------------
+variable "vpc_cidr" {
+  description = "CIDR block for the VPC."
+  type        = string
+
+  validation {
+    condition     = can(cidrhost(var.vpc_cidr, 0))
+    error_message = "vpc_cidr must be a valid IPv4 CIDR block."
+  }
+}
+
+variable "availability_zones" {
+  description = "Exactly two AZs to spread subnets across for high availability."
+  type        = list(string)
+
+  validation {
+    condition     = length(var.availability_zones) == 2
+    error_message = "Phase 1 expects exactly 2 availability zones."
+  }
+}
+
+variable "public_subnet_cidrs" {
+  description = "CIDRs for the public subnets (ALB). One per AZ, same order as availability_zones."
+  type        = list(string)
+
+  validation {
+    condition     = length(var.public_subnet_cidrs) == 2
+    error_message = "Provide exactly 2 public subnet CIDRs."
+  }
+}
+
+variable "private_subnet_cidrs" {
+  description = "CIDRs for the private subnets (ECS tasks). One per AZ, same order as availability_zones."
+  type        = list(string)
+
+  validation {
+    condition     = length(var.private_subnet_cidrs) == 2
+    error_message = "Provide exactly 2 private subnet CIDRs."
+  }
+}
+
+# ---------------------------------------------------------------------------
+# Application / ECS
+# ---------------------------------------------------------------------------
+variable "container_port" {
+  description = "Port the container listens on (must match the Dockerfile)."
+  type        = number
+  default     = 8080
+}
+
+variable "image_tag" {
+  description = "Tag of the image in ECR to deploy."
+  type        = string
+  default     = "latest"
+}
+
+variable "task_cpu" {
+  description = "Fargate task CPU units (256 = 0.25 vCPU)."
+  type        = number
+  default     = 256
+}
+
+variable "task_memory" {
+  description = "Fargate task memory in MiB. Must be a valid pairing with task_cpu."
+  type        = number
+  default     = 512
+}
+
+variable "desired_count" {
+  description = "Number of ECS tasks to run. Use >= 2 so both AZs get a task."
+  type        = number
+  default     = 2
+}
+
+variable "health_check_path" {
+  description = "Path the ALB uses to health-check the containers."
+  type        = string
+  default     = "/health"
+}

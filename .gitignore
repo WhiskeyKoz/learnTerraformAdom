@@ -1,0 +1,20 @@
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfplan
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# NOTE: terraform.tfvars is intentionally committed - it holds only
+# non-secret configuration. Never put credentials or secrets in it.
+# .terraform.lock.hcl is also committed to pin provider versions.
+
+# Python
+__pycache__/
+*.pyc
+.venv/
