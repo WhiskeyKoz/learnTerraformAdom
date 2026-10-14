@@ -46,8 +46,8 @@ routes in private route tables only; second ECR repo / IAM role / log group / in
 | 3 | Make modules reusable (network w/o public subnets, internal ALB, flexible ECS) – Phase 1 plan must show no changes | ✅ Done – plan identical to Phase 1 (only 3 intended address moves), new options proven with a test config |
 | 4 | VPC B + peering + routes | ✅ Done – plan only (57 to add); Phase 1 resources identical; overlap check proven |
 | 5 | Backend layer (ECR, IAM, internal ALB, ECS) | ✅ Done – plan only (75 to add); Phase 1 resources renamed to `frontend` |
-| 6 | Security groups between the VPCs (network only) | ⏳ Next |
-| 7 | `deploy.ps1` for 2 images | ⬜ |
+| 6 | Security groups between the VPCs (network only) | ✅ Done – plan only (77 to add); only 2 rules cross the VPCs |
+| 7 | `deploy.ps1` for 2 images | ⏳ Next |
 | 8 | Full deploy + tests | ⬜ |
 
 ### Backend API (Phase 2 Step 1)
@@ -225,7 +225,7 @@ The same 4 modules (ecr, iam, alb, ecs) + a log group are now used **once per la
 - New outputs: `backend_url`, `frontend_/backend_ecr_repository_url`, `..._log_group_name`,
   `..._ecs_cluster_name`, `..._ecs_service_name`, `frontend_tasks_security_group_id`,
   `backend_alb_security_group_id`. (`ecr_repository_url`, `log_group_name`, IAM role ARN outputs removed.)
-- After Step 5 the internal ALB has **no ingress rule** → nobody can call it yet (Step 6).
+- After Step 5 the internal ALB had **no ingress rule** → nobody could call it (fixed in Step 6).
 - **`scripts/deploy.ps1` is broken until Step 7** (still uses `module.ecr`, `image_tag`, `ecr_repository_url`).
 
 **Tests (plan only, 2026-10-14):**
@@ -239,6 +239,42 @@ The same 4 modules (ecr, iam, alb, ecs) + a log group are now used **once per la
 
 Task definitions show `container_definitions = (known after apply)` in the plan (the ECR URL doesn't
 exist yet), so the wiring was proven with the dependency graph instead.
+
+### Security between the VPCs (Phase 2 Step 6) – network only
+
+```
+ VPC A                                              VPC B
+ frontend tasks SG ──(1) out: port 80 only──▶ internal ALB SG ──8080──▶ backend tasks SG
+                      to the internal ALB SG   (2) in: port 80 only
+                                                   from the frontend tasks SG
+```
+
+- **Gate 1 (outbound, `ecs_frontend.additional_egress_rules`):** frontend tasks may call **only the
+  internal ALB**, port 80 – not the backend tasks directly, not anything else in VPC B.
+- **Gate 2 (inbound, `alb_backend.ingress_security_groups`):** the internal ALB accepts port 80
+  **only from the frontend tasks SG**. No CIDR rule (not even `10.10.0.0/16`) → the public ALB and
+  anything else in VPC A can't call it, even though the peering route exists.
+- **SG-to-SG reference across the peering** (allowed for same-region peering): new frontend task IPs
+  need no rule change, and nothing else in the CIDR gets access.
+- **`depends_on = [module.peering]`** on `alb_backend` and `ecs_frontend`: AWS accepts a rule that
+  references a SG in the *other* VPC only once the peering is active; on destroy the rule must go
+  before the peering. depends_on enforces both orders (safe here: those modules have no data sources).
+- **Security groups are stateful:** replies are allowed automatically – no rule back is needed.
+- **Decision: network only, no API key.** The SG rules allow exactly one caller; an API key would add a
+  secret to store and rotate (Secrets Manager + VPC endpoint in VPC B) for little extra value in this demo.
+  Production with many callers → add app-level auth (API key / IAM SigV4 / mTLS) on top: defense in depth.
+
+**Tests (plan only, 2026-10-14):**
+
+| Test | Result |
+|---|---|
+| Plan | 77 to add (75 + 2 rules), no dependency cycle |
+| All 15 SG rules listed from the plan | Only 2 cross the VPCs (both port 80, frontend tasks SG ↔ internal ALB SG). Only `0.0.0.0/0` rule = public ALB. Backend tasks: in 8080 only from their ALB, out 443 only to VPC B endpoints + S3 |
+| Order (`terraform graph`) | Both new rules depend on the peering connection + both routes |
+
+Interview lines: *"Routes are the road, security groups are the gate – the route lets all of VPC A reach
+VPC B, the SGs let in exactly one caller."* · *"SG reference instead of CIDR: follows the tasks, not
+their IPs."*
 
 ### Interview notes: Terraform `for_each` keys
 

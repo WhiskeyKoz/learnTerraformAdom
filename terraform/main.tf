@@ -138,13 +138,27 @@ module "ecs_frontend" {
 
   # The frontend finds the backend through the internal ALB's DNS name.
   # The name is public DNS but resolves to PRIVATE IPs in VPC B - reachable
-  # only over the peering. Security group rules to allow it: Step 6.
+  # only over the peering.
   environment_variables = {
     BACKEND_URL = "http://${module.alb_backend.alb_dns_name}"
   }
 
+  # Gate 1 of 2 (outbound): frontend tasks may call ONLY the backend's
+  # internal ALB, on port 80 - not the backend tasks, not anything else in
+  # VPC B. SG-to-SG reference across the peering (same region).
+  additional_egress_rules = [{
+    description                  = "HTTP to the backend internal ALB (VPC B, over peering)"
+    port                         = 80
+    referenced_security_group_id = module.alb_backend.alb_security_group_id
+  }]
+
   desired_count             = var.desired_count
   enable_container_insights = var.enable_container_insights
+
+  # A rule that references a security group in the OTHER VPC is only
+  # accepted once the peering is active - and on destroy it must be deleted
+  # before the peering. depends_on enforces both orders.
+  depends_on = [module.peering]
 }
 
 # ===========================================================================
@@ -180,8 +194,10 @@ module "iam_backend" {
   log_group_arn      = aws_cloudwatch_log_group.backend.arn
 }
 
-# Internal ALB: private IPs only, in VPC B's private subnets. No ingress
-# rule yet - who may call it (the frontend tasks) is decided in Step 6.
+# Internal ALB: private IPs only, in VPC B's private subnets.
+# Gate 2 of 2 (inbound): it accepts HTTP ONLY from the frontend tasks' SG.
+# No CIDR rule - not even 10.10.0.0/16 - so the public ALB and anything else
+# in VPC A can't call it, even though the peering route exists.
 module "alb_backend" {
   source = "./modules/alb"
 
@@ -192,6 +208,13 @@ module "alb_backend" {
   subnet_ids        = module.network_backend.private_subnet_ids
   container_port    = var.container_port
   health_check_path = var.health_check_path
+
+  ingress_security_groups = {
+    frontend_tasks = module.ecs_frontend.tasks_security_group_id
+  }
+
+  # Cross-VPC SG reference needs an active peering (see ecs_frontend).
+  depends_on = [module.peering]
 }
 
 module "ecs_backend" {
