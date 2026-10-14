@@ -29,11 +29,116 @@ Deployed and verified end to end (40 resources), then destroyed to save cost.
 | 6 | `ecs` module – cluster, task definition, service, SG | ✅ Done – applied & verified |
 | 7 | Full deploy + end-to-end test (ALB URL, AZ alternation, logs, negative tests, drift) | ✅ Done – all passed (see "End-to-end results") |
 
+## Quick start – deploy with one script
+
+The file `scripts/deploy.ps1` does **all the deploy work for you**. You type **one** command
+instead of about 10.
+
+### Before you start
+
+1. **Docker Desktop is running** (whale icon in the taskbar).
+2. **AWS login works** – if not, run `aws configure`.
+3. Open **PowerShell** and go to the project folder:
+   ```powershell
+   cd "C:\Users\navek\Nave files\adom terraform project\learnTerraformAdom"
+   ```
+
+### Deploy
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\deploy.ps1
+```
+
+Terraform stops **2 times** and asks `Enter a value:` – type **`yes`** and press Enter.
+It takes about **6–8 minutes**. At the end it prints the **link to your app**.
+Open it in the browser and type `http://` at the start (not `https://`).
+
+### Delete everything when you finish (stops the cost, ~$0.09/hour)
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\deploy.ps1 -Destroy
+```
+
+Type **`yes`** when it asks.
+
+### What the script does – in this order
+
+```
+ You type: .\scripts\deploy.ps1
+              │
+              ▼
+ ① CHECK     Is Terraform installed? Docker running? AWS login OK?
+              │   (if something is missing → it stops and tells you what)
+              ▼
+ ② ECR       terraform apply "-target=module.ecr"
+              │   Creates ONLY the empty image storage (ECR). Nothing else.
+              ▼
+ ③ IMAGE     docker build + docker push
+              │   Builds the app image and uploads it into ECR.
+              │   (skipped if this image tag is already in ECR)
+              ▼
+ ④ DEPLOY    terraform apply
+              │   Creates everything else: network, IAM, load balancer, containers.
+              │   ECR already exists, so Terraform does not create it again.
+              │   Waits until the 2 containers are healthy (~4 min).
+              ▼
+ ⑤ TEST      Opens the app 10 times → shows how many answers came from each AZ
+              ▼
+ ⑥ CHECK     terraform plan → must say "No changes" (code and AWS match)
+              ▼
+ ✅ Prints your link:  http://adom-demo-dev-alb-....amazonaws.com
+```
+
+### Why this order? (the most important part)
+
+The containers need the image **before** they start. If you run one plain `terraform apply`,
+Terraform creates everything at once – the containers start, but **ECR is still empty**, so they fail.
+
+`-target=module.ecr` means: **"read all of `main.tf`, but create ONLY the ECR part."**
+
+```
+main.tf                      Step ② (-target)     Step ④ (normal apply)
+ ├── module "network"         ⏸ skipped            ✅ created
+ ├── module "ecr"             ✅ CREATED           ✔ already exists – no change
+ ├── module "iam"             ⏸ skipped            ✅ created
+ ├── module "alb"             ⏸ skipped            ✅ created
+ └── module "ecs"             ⏸ skipped            ✅ created (image is already in ECR)
+```
+
+Like a restaurant: **first** build the fridge (ECR), **then** put the food inside (push the image),
+**then** open the kitchen (ECS) – the cooks find food in the fridge right away.
+
+### Options
+
+| You type | What happens |
+|---|---|
+| `.\scripts\deploy.ps1` | Deploy. Asks you to type `yes` before creating things |
+| `.\scripts\deploy.ps1 -AutoApprove` | Deploy without asking `yes` (needed when running from Claude Code with `!`) |
+| `.\scripts\deploy.ps1 -Destroy` | Delete everything from AWS |
+| `.\scripts\deploy.ps1 -ImageTag v1.0.1` | Build, upload and deploy a **new version** of the app (tags can't be reused) |
+| `Get-Help .\scripts\deploy.ps1 -Full` | Show the built-in help |
+
+(Add `powershell -ExecutionPolicy Bypass -File` in front if Windows blocks scripts.)
+
+### If you get an error
+
+| Message | What to do |
+|---|---|
+| `Docker is not running` | Open Docker Desktop, wait 1 minute, run again |
+| `AWS credentials check failed` | Run `aws configure` |
+| `running scripts is disabled on this system` | Use `powershell -ExecutionPolicy Bypass -File .\scripts\deploy.ps1` |
+| `'terraform' not found` | Install it: `winget install Hashicorp.Terraform`, then open a new PowerShell |
+| Browser shows nothing / timeout | You opened `https://` – type `http://` at the start of the link |
+
+The manual commands the script runs are in **"Deploy from scratch"** below (for learning / debugging).
+
 ## Project structure
 
 ```
 .
 ├── CLAUDE.md
+├── scripts/
+│   └── deploy.ps1          # one-command deploy / destroy (see "Quick start")
 ├── tests/
 │   └── egress-test.json    # one-off ECS task override: proves tasks cannot reach the internet
 ├── app/
@@ -137,7 +242,9 @@ Module outputs: `alb_dns_name`, `alb_arn`, `alb_security_group_id`, `target_grou
 - Module outputs: `cluster_name`, `service_name`, `task_definition_arn`, `tasks_security_group_id`.
 - Root outputs: `app_url`, `ecs_cluster_name`, `ecs_service_name`.
 
-## Deploy from scratch (order matters)
+## Deploy from scratch (order matters) – manual commands
+
+**Easy way:** `.\scripts\deploy.ps1` (see "Quick start"). These are the same steps by hand.
 
 ECS can't run an image that isn't in ECR yet, and `wait_for_steady_state = true` makes `apply`
 wait for healthy tasks – so a single `apply` from zero would hang and then fail. Use:
@@ -333,8 +440,10 @@ aws iam simulate-principal-policy --policy-source-arn <execution-role-arn> --act
 - **Base image CVEs:** scan of `python:3.12-slim` found 3 HIGH (zlib CVE-2026-85091, glibc
   CVE-2026-5435, CVE-2026-19499), 9 MEDIUM, 3 LOW – all in OS packages, not app code. Fix by
   rebuilding once Debian ships patches, or add `apt-get upgrade` in the Dockerfile.
-- **Environment is currently destroyed** (cost saving). Follow "Deploy from scratch" to recreate
-  (`ecr_force_delete = true` deleted the image with the repo, so it must be pushed again).
+- **Environment is currently destroyed** (cost saving). Recreate with `.\scripts\deploy.ps1`
+  (`ecr_force_delete = true` deleted the image with the repo; the script pushes it again).
+- **`scripts/deploy.ps1` deploy path not yet run end to end** – only its `-Destroy` path (on empty
+  state) and helper functions were tested. Parse check passed on Windows PowerShell 5.1.
 - **HTTPS:** HTTP-only for the demo. Production: ACM certificate + 443 listener + 80→443 redirect.
 - **Possible hardening later:** ALB access logs to S3, VPC Flow Logs, WAF on the ALB, ECS Exec
   (needs `ssmmessages` endpoint + task role permissions), remote state backend (S3 + lockfile).
