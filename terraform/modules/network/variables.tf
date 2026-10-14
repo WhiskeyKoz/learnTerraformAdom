@@ -18,9 +18,21 @@ variable "availability_zones" {
   type        = list(string)
 }
 
+variable "create_public_subnets" {
+  description = "Create public subnets + Internet Gateway. false = private-only VPC with no internet path at all (Phase 2 VPC B)."
+  type        = bool
+  default     = true
+}
+
 variable "public_subnet_cidrs" {
-  description = "Public subnet CIDRs, one per AZ."
+  description = "Public subnet CIDRs, one per AZ. Ignored (may be empty) when create_public_subnets = false."
   type        = list(string)
+  default     = []
+
+  validation {
+    condition     = !var.create_public_subnets || length(var.public_subnet_cidrs) == length(var.availability_zones)
+    error_message = "With create_public_subnets = true, provide one public subnet CIDR per availability zone."
+  }
 }
 
 variable "private_subnet_cidrs" {

@@ -17,3 +17,9 @@ variable "log_group_arn" {
   description = "ARN of the CloudWatch log group the containers write to."
   type        = string
 }
+
+variable "component" {
+  description = "Optional name part, e.g. \"backend\" -> <name_prefix>-backend-ecs-execution-role. Empty keeps the Phase 1 names."
+  type        = string
+  default     = ""
+}

@@ -43,8 +43,8 @@ Bonus – DynamoDB vs. S3, email yes/no.
 |---|---|---|
 | 1 | Backend app (`app/backend`: API, `quotes.txt`, Dockerfile) | ✅ Done – tested locally in Docker |
 | 2 | Frontend app update (backend call, quote box, graceful degradation) + `docker compose` | ✅ Done – tested locally with `docker compose`, UI checked by user |
-| 3 | Make modules reusable (network w/o public subnets, internal ALB, flexible ECS) – Phase 1 plan must show no changes | ⏳ Next |
-| 4 | VPC B + peering + routes | ⬜ |
+| 3 | Make modules reusable (network w/o public subnets, internal ALB, flexible ECS) – Phase 1 plan must show no changes | ✅ Done – plan identical to Phase 1 (only 3 intended address moves), new options proven with a test config |
+| 4 | VPC B + peering + routes | ⏳ Next |
 | 5 | Backend layer (ECR, IAM, internal ALB, ECS) | ⬜ |
 | 6 | Security groups between the VPCs (user decision) | ⬜ |
 | 7 | `deploy.ps1` for 2 images | ⬜ |
@@ -120,6 +120,66 @@ Results (2026-10-14): page shows both boxes + quote; 20 loads → 11 different q
 reachable from host; backend stopped → page 200 in 2.07 s (red box); frozen → 2.05 s ("Timeout");
 recovery 10/10 OK; frontend `/health` stays OK while backend is down; both containers `appuser`,
 read-only, caps dropped. UI checked by the user in the browser.
+
+### Reusable modules (Phase 2 Step 3)
+
+New module options. **Unused option = exact Phase 1 behavior.**
+
+| Module | Option | Default | Purpose |
+|---|---|---|---|
+| network | `create_public_subnets` | `true` | `false` → private-only VPC: no IGW, no public subnets/RT, no `0.0.0.0/0` (VPC B). `public_subnet_cidrs` may then be `[]` |
+| alb | `internal` | `false` | Internal ALB (private IPs) for the backend |
+| alb | `subnet_ids` | – | Renamed from `public_subnet_ids` (internal ALB uses private subnets) |
+| alb | `ingress_security_groups` | `{}` | `{ label = sg_id }` – SG-to-SG ingress (works across same-region peering) |
+| alb | `ingress_cidrs` | `[]` | Now optional |
+| alb, ecs, iam | `component` | `""` | Name part: `"backend"` → `adom-demo-dev-backend-alb`, `...-backend-cluster`, `...-backend-ecs-execution-role`. `""` keeps Phase 1 names |
+| ecs | `environment_variables` | `{}` | Extra env vars (e.g. `BACKEND_URL`), merged over `APP_ENV` / `APP_NAME` |
+| ecs | `additional_egress_rules` | `[]` | `[{ description, port, cidr_ipv4 \| referenced_security_group_id }]` – exactly one destination per rule (validated) |
+
+- **`moved` blocks** in the network module: IGW, public RT and its route became `count`-based
+  (`this` → `this[0]`). `moved` tells Terraform it's the same object → a deployed VPC isn't recreated.
+- Public ALB SG description kept word-for-word (changing a SG description forces replacement);
+  internal ALBs get their own text.
+- Max name lengths checked: longest IAM role 41/64 chars, longest ALB/TG name 26/32.
+
+**How "no change to Phase 1" was proven (environment destroyed, so no live diff possible):**
+saved the full `terraform plan` output **before** the refactor (1179 lines, 40 resources), refactored,
+planned again and compared line by line (`Compare-Object`). Only differences: the 3 intended
+`this` → `this[0]` addresses + a timing line. All names/attributes identical.
+
+**How the new options were proven:** a throwaway root config (outside the repo, deleted after) used
+every option like Phase 2 will: private-only VPC → 0 IGW / 0 public subnets / 0 `0.0.0.0/0` routes;
+internal ALB `internal = true`; SG ingress + extra egress rules; `BACKEND_URL` in the task definition.
+
+**Bug found by that test (fixed):** `ingress_security_group_ids` was a `list` used as
+`for_each = toset(...)`. A SG created in the same apply has an unknown ID at plan time →
+`Error: Invalid for_each argument`. Fixed by a `map` with static labels as keys
+(`{ frontend_tasks = sg_id }`). Retested with a not-yet-existing SG → plans fine.
+
+### Interview notes: Terraform `for_each` keys
+
+- **The key is the resource's identity in state** (`aws_subnet.private["eu-central-1a"]`). Change the
+  key → Terraform destroys the old object and creates a new one.
+- **`count` vs `for_each`:** `count` identifies by index – removing an item from the middle shifts all
+  later indexes → destroy + recreate. `for_each` identifies by key → only that item changes.
+  Use `for_each` for things with a natural name (subnets keyed by AZ); `count` only as an on/off
+  switch (`count = var.enabled ? 1 : 0`).
+- **Keys must be known at plan time; values may be "known after apply".** Never key by IDs AWS
+  generates – use static labels/variables as keys and put IDs in the values.
+- **Refactor without recreating:** `moved { from = ... to = ... }` when an address changes
+  (adding `count`, renaming a key or resource).
+- In this project: subnets `for_each` by AZ name · IGW/public RT `count` on/off + `moved` ·
+  ALB `ingress_security_groups` map with static labels · ECS `additional_egress_rules` keyed by list
+  position (static even when the SG ID isn't known).
+
+Sample answers:
+- *"count vs for_each?"* – count = index identity, removing from the middle recreates everything after
+  it; for_each = key identity, only that item changes. I key subnets by AZ name.
+- *"A for_each error you fixed?"* – for_each over SG IDs created in the same apply → unknown keys at plan
+  time. Switched to a map with static labels as keys; caught it before deploying by planning a test
+  config that used the module like the real Phase 2 code.
+- *"Refactor without destroying?"* – `moved` blocks, then prove it by comparing the full plan before
+  and after.
 
 ## Progress
 

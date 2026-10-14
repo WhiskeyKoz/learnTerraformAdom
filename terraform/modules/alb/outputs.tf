@@ -1,5 +1,5 @@
 output "alb_dns_name" {
-  description = "Public DNS name of the ALB."
+  description = "DNS name of the ALB (internal ALBs resolve to private IPs only)."
   value       = aws_lb.this.dns_name
 }
 

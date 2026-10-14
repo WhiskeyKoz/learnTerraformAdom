@@ -4,24 +4,35 @@
 # Fargate cluster + task definition + service. Tasks run in the PRIVATE
 # subnets with no public IP; the ALB is the only way in, and VPC endpoints
 # are the only way out (to ECR, S3 and CloudWatch Logs).
+#
+# Reusable per layer: `component` names the resources (frontend/backend),
+# `environment_variables` passes config like BACKEND_URL, and
+# `additional_egress_rules` opens specific extra destinations.
 # ---------------------------------------------------------------------------
 
 locals {
   container_name = "app"
+
+  # "" keeps the Phase 1 names; "backend" -> <prefix>-backend-cluster etc.
+  base = var.component == "" ? var.name_prefix : "${var.name_prefix}-${var.component}"
+
+  # Defaults first, caller overrides win. A map iterates in key order, so the
+  # JSON is stable between plans (no task-definition drift).
+  environment = merge({ APP_ENV = var.environment, APP_NAME = local.base }, var.environment_variables)
 }
 
 # ---------------------------------------------------------------------------
 # Cluster
 # ---------------------------------------------------------------------------
 resource "aws_ecs_cluster" "this" {
-  name = "${var.name_prefix}-cluster"
+  name = "${local.base}-cluster"
 
   setting {
     name  = "containerInsights"
     value = var.enable_container_insights ? "enabled" : "disabled"
   }
 
-  tags = { Name = "${var.name_prefix}-cluster" }
+  tags = { Name = "${local.base}-cluster" }
 }
 
 # ---------------------------------------------------------------------------
@@ -36,11 +47,11 @@ resource "aws_ecs_cluster" "this" {
 # link-local and not filtered by security groups.
 # ---------------------------------------------------------------------------
 resource "aws_security_group" "tasks" {
-  name        = "${var.name_prefix}-ecs-tasks-sg"
+  name        = "${local.base}-ecs-tasks-sg"
   description = "ECS tasks: in from ALB only, out to VPC endpoints only"
   vpc_id      = var.vpc_id
 
-  tags = { Name = "${var.name_prefix}-ecs-tasks-sg" }
+  tags = { Name = "${local.base}-ecs-tasks-sg" }
 }
 
 resource "aws_vpc_security_group_ingress_rule" "tasks_from_alb" {
@@ -70,6 +81,20 @@ resource "aws_vpc_security_group_egress_rule" "tasks_to_s3" {
   to_port           = 443
 }
 
+# Caller-defined extra destinations (e.g. frontend tasks -> backend internal
+# ALB across the VPC peering). Keyed by index - order in the list matters.
+resource "aws_vpc_security_group_egress_rule" "tasks_additional" {
+  for_each = { for idx, rule in var.additional_egress_rules : tostring(idx) => rule }
+
+  security_group_id            = aws_security_group.tasks.id
+  description                  = each.value.description
+  cidr_ipv4                    = each.value.cidr_ipv4
+  referenced_security_group_id = each.value.referenced_security_group_id
+  ip_protocol                  = "tcp"
+  from_port                    = each.value.port
+  to_port                      = each.value.port
+}
+
 # The matching egress rule on the ALB's SG lives here because it references
 # the tasks SG owned by this module: ALB may only talk to the tasks, on the
 # container port.
@@ -86,7 +111,7 @@ resource "aws_vpc_security_group_egress_rule" "alb_to_tasks" {
 # Task definition
 # ---------------------------------------------------------------------------
 resource "aws_ecs_task_definition" "app" {
-  family                   = "${var.name_prefix}-app"
+  family                   = "${local.base}-app"
   requires_compatibilities = ["FARGATE"]
   network_mode             = "awsvpc" # required by Fargate: one ENI + private IP per task
   cpu                      = var.task_cpu
@@ -119,10 +144,7 @@ resource "aws_ecs_task_definition" "app" {
       volumesFrom    = []
       systemControls = []
 
-      environment = [
-        { name = "APP_ENV", value = var.environment },
-        { name = "APP_NAME", value = var.name_prefix },
-      ]
+      environment = [for name, value in local.environment : { name = name, value = value }]
 
       # Container hardening (defense in depth - the image already runs as non-root):
       readonlyRootFilesystem = true # an attacker can't modify binaries/code on disk
@@ -141,14 +163,14 @@ resource "aws_ecs_task_definition" "app" {
     }
   ])
 
-  tags = { Name = "${var.name_prefix}-app" }
+  tags = { Name = "${local.base}-app" }
 }
 
 # ---------------------------------------------------------------------------
 # Service
 # ---------------------------------------------------------------------------
 resource "aws_ecs_service" "app" {
-  name             = "${var.name_prefix}-app"
+  name             = "${local.base}-app"
   cluster          = aws_ecs_cluster.this.id
   task_definition  = aws_ecs_task_definition.app.arn
   desired_count    = var.desired_count
@@ -190,5 +212,5 @@ resource "aws_ecs_service" "app" {
   enable_ecs_managed_tags = true
   propagate_tags          = "SERVICE"
 
-  tags = { Name = "${var.name_prefix}-app" }
+  tags = { Name = "${local.base}-app" }
 }

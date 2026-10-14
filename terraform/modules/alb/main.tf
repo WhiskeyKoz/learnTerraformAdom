@@ -1,26 +1,36 @@
 # ---------------------------------------------------------------------------
 # ALB module
 #
-# Internet-facing Application Load Balancer in the public subnets (one per AZ).
-# It is the ONLY entry point to the application: tasks have no public IPs and
+# Application Load Balancer, one per layer:
+#   internal = false -> internet-facing, in public subnets (frontend, VPC A)
+#   internal = true  -> internal, private IPs only, in private subnets
+#                       (backend, VPC B - reached over VPC peering)
+# It is the ONLY entry point to its tasks: tasks have no public IPs and
 # their security group only accepts traffic from this ALB.
 #
 #   Internet --80--> ALB (public subnets) --8080--> ECS tasks (private subnets)
 # ---------------------------------------------------------------------------
 
+locals {
+  # "" keeps the Phase 1 names; "backend" -> <prefix>-backend-alb etc.
+  base = var.component == "" ? var.name_prefix : "${var.name_prefix}-${var.component}"
+}
+
 # ---------------------------------------------------------------------------
 # Security group
-# Ingress: HTTP 80 from the allowed CIDRs.
+# Ingress: HTTP 80 from the allowed CIDRs and/or security groups.
 # Egress:  added by the ecs module (ALB -> tasks SG on the container port),
 #          because it references the tasks SG that module owns. Until then
 #          the ALB can send nothing anywhere.
 # ---------------------------------------------------------------------------
 resource "aws_security_group" "alb" {
-  name        = "${var.name_prefix}-alb-sg"
-  description = "Public ALB: HTTP in from allowed CIDRs, out to ECS tasks only"
+  name = "${local.base}-alb-sg"
+  # Changing a SG description forces replacement - the public text is kept
+  # exactly as in Phase 1.
+  description = var.internal ? "Internal ALB: HTTP in from allowed sources only, out to ECS tasks only" : "Public ALB: HTTP in from allowed CIDRs, out to ECS tasks only"
   vpc_id      = var.vpc_id
 
-  tags = { Name = "${var.name_prefix}-alb-sg" }
+  tags = { Name = "${local.base}-alb-sg" }
 }
 
 resource "aws_vpc_security_group_ingress_rule" "alb_http" {
@@ -34,14 +44,25 @@ resource "aws_vpc_security_group_ingress_rule" "alb_http" {
   to_port           = 80
 }
 
+resource "aws_vpc_security_group_ingress_rule" "alb_http_from_sg" {
+  for_each = var.ingress_security_groups
+
+  security_group_id            = aws_security_group.alb.id
+  description                  = "HTTP from ${each.key} security group"
+  referenced_security_group_id = each.value
+  ip_protocol                  = "tcp"
+  from_port                    = 80
+  to_port                      = 80
+}
+
 # ---------------------------------------------------------------------------
 # Load balancer
 # ---------------------------------------------------------------------------
 resource "aws_lb" "this" {
-  name               = "${var.name_prefix}-alb"
+  name               = "${local.base}-alb"
   load_balancer_type = "application"
-  internal           = false
-  subnets            = var.public_subnet_ids
+  internal           = var.internal
+  subnets            = var.subnet_ids
   security_groups    = [aws_security_group.alb.id]
 
   # Drop requests with malformed HTTP headers instead of forwarding them
@@ -50,7 +71,7 @@ resource "aws_lb" "this" {
 
   enable_deletion_protection = var.enable_deletion_protection
 
-  tags = { Name = "${var.name_prefix}-alb" }
+  tags = { Name = "${local.base}-alb" }
 }
 
 # ---------------------------------------------------------------------------
@@ -59,7 +80,7 @@ resource "aws_lb" "this" {
 # task gets its own ENI/IP, and the ALB routes straight to that IP.
 # ---------------------------------------------------------------------------
 resource "aws_lb_target_group" "app" {
-  name        = "${var.name_prefix}-tg"
+  name        = "${local.base}-tg"
   vpc_id      = var.vpc_id
   target_type = "ip"
   protocol    = "HTTP"
@@ -78,7 +99,7 @@ resource "aws_lb_target_group" "app" {
     unhealthy_threshold = 3
   }
 
-  tags = { Name = "${var.name_prefix}-tg" }
+  tags = { Name = "${local.base}-tg" }
 }
 
 # ---------------------------------------------------------------------------

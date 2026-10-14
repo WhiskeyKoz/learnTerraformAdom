@@ -9,7 +9,7 @@ output "vpc_cidr" {
 }
 
 output "public_subnet_ids" {
-  description = "Public subnet IDs (for the ALB)."
+  description = "Public subnet IDs (for the ALB). Empty list for a private-only VPC."
   value       = [for s in aws_subnet.public : s.id]
 }
 
@@ -24,8 +24,8 @@ output "private_subnet_cidrs" {
 }
 
 output "public_route_table_id" {
-  description = "Public route table ID."
-  value       = aws_route_table.public.id
+  description = "Public route table ID (null for a private-only VPC)."
+  value       = one(aws_route_table.public[*].id)
 }
 
 output "private_route_table_id" {

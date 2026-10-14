@@ -6,18 +6,37 @@
 #   Private subnets -> NO internet route; AWS services reached via VPC endpoints
 #                      (ECS tasks live here)
 #
-# Written as a reusable module so Phase 2 can create VPC B with a second call.
+# Reusable: VPC A (frontend) uses it as-is; VPC B (backend) sets
+# create_public_subnets = false -> no IGW, no public subnets, no internet path.
 # ---------------------------------------------------------------------------
 
 locals {
   # Key subnets by AZ name instead of list index: with for_each, adding or
   # removing an AZ later won't shift/recreate the other subnets (as count would).
-  subnets = {
-    for idx, az in var.availability_zones : az => {
-      public_cidr  = var.public_subnet_cidrs[idx]
-      private_cidr = var.private_subnet_cidrs[idx]
-    }
+  private_subnets = {
+    for idx, az in var.availability_zones : az => var.private_subnet_cidrs[idx]
   }
+  public_subnets = var.create_public_subnets ? {
+    for idx, az in var.availability_zones : az => var.public_subnet_cidrs[idx]
+  } : {}
+}
+
+# The IGW and public route table became optional (count). These blocks tell
+# Terraform the existing objects just moved to index [0], so an already
+# deployed VPC isn't destroyed and re-created by this refactor.
+moved {
+  from = aws_internet_gateway.this
+  to   = aws_internet_gateway.this[0]
+}
+
+moved {
+  from = aws_route_table.public
+  to   = aws_route_table.public[0]
+}
+
+moved {
+  from = aws_route.public_internet
+  to   = aws_route.public_internet[0]
 }
 
 # ---------------------------------------------------------------------------
@@ -44,6 +63,8 @@ resource "aws_default_security_group" "this" {
 }
 
 resource "aws_internet_gateway" "this" {
+  count = var.create_public_subnets ? 1 : 0
+
   vpc_id = aws_vpc.this.id
 
   tags = { Name = "${var.name_prefix}-igw" }
@@ -53,11 +74,11 @@ resource "aws_internet_gateway" "this" {
 # Subnets
 # ---------------------------------------------------------------------------
 resource "aws_subnet" "public" {
-  for_each = local.subnets
+  for_each = local.public_subnets
 
   vpc_id            = aws_vpc.this.id
   availability_zone = each.key
-  cidr_block        = each.value.public_cidr
+  cidr_block        = each.value
 
   # The ALB gets its public IPs from AWS regardless; nothing else in this
   # subnet should silently receive a public IP.
@@ -70,11 +91,11 @@ resource "aws_subnet" "public" {
 }
 
 resource "aws_subnet" "private" {
-  for_each = local.subnets
+  for_each = local.private_subnets
 
   vpc_id            = aws_vpc.this.id
   availability_zone = each.key
-  cidr_block        = each.value.private_cidr
+  cidr_block        = each.value
 
   map_public_ip_on_launch = false
 
@@ -88,22 +109,26 @@ resource "aws_subnet" "private" {
 # Route tables
 # ---------------------------------------------------------------------------
 resource "aws_route_table" "public" {
+  count = var.create_public_subnets ? 1 : 0
+
   vpc_id = aws_vpc.this.id
 
   tags = { Name = "${var.name_prefix}-public-rt" }
 }
 
 resource "aws_route" "public_internet" {
-  route_table_id         = aws_route_table.public.id
+  count = var.create_public_subnets ? 1 : 0
+
+  route_table_id         = aws_route_table.public[0].id
   destination_cidr_block = "0.0.0.0/0"
-  gateway_id             = aws_internet_gateway.this.id
+  gateway_id             = aws_internet_gateway.this[0].id
 }
 
 resource "aws_route_table_association" "public" {
   for_each = aws_subnet.public
 
   subnet_id      = each.value.id
-  route_table_id = aws_route_table.public.id
+  route_table_id = aws_route_table.public[0].id
 }
 
 # One shared private route table is enough: with no NAT Gateway there is no

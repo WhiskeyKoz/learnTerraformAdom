@@ -57,7 +57,7 @@ module "alb" {
 
   name_prefix       = local.name_prefix
   vpc_id            = module.network.vpc_id
-  public_subnet_ids = module.network.public_subnet_ids
+  subnet_ids        = module.network.public_subnet_ids
   ingress_cidrs     = var.alb_ingress_cidrs
   container_port    = var.container_port
   health_check_path = var.health_check_path

@@ -17,6 +17,9 @@ data "aws_caller_identity" "current" {}
 
 locals {
   account_id = data.aws_caller_identity.current.account_id
+
+  # "" keeps the Phase 1 names; "backend" -> <prefix>-backend-ecs-execution-role etc.
+  base = var.component == "" ? var.name_prefix : "${var.name_prefix}-${var.component}"
 }
 
 # ---------------------------------------------------------------------------
@@ -53,7 +56,7 @@ data "aws_iam_policy_document" "ecs_tasks_trust" {
 # Task execution role
 # ---------------------------------------------------------------------------
 resource "aws_iam_role" "execution" {
-  name               = "${var.name_prefix}-ecs-execution-role"
+  name               = "${local.base}-ecs-execution-role"
   description        = "Lets ECS pull the app image from ECR and write container logs"
   assume_role_policy = data.aws_iam_policy_document.ecs_tasks_trust.json
 }
@@ -96,7 +99,7 @@ data "aws_iam_policy_document" "execution" {
 }
 
 resource "aws_iam_role_policy" "execution" {
-  name   = "${var.name_prefix}-ecs-execution-policy"
+  name   = "${local.base}-ecs-execution-policy"
   role   = aws_iam_role.execution.id
   policy = data.aws_iam_policy_document.execution.json
 }
@@ -108,7 +111,7 @@ resource "aws_iam_role_policy" "execution" {
 # Add narrowly scoped statements here only when the app needs them
 # (e.g. ssmmessages:* for ECS Exec, or s3:GetObject on one bucket).
 resource "aws_iam_role" "task" {
-  name               = "${var.name_prefix}-ecs-task-role"
+  name               = "${local.base}-ecs-task-role"
   description        = "Runtime identity of the app container (no permissions by default)"
   assume_role_policy = data.aws_iam_policy_document.ecs_tasks_trust.json
 }

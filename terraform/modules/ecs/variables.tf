@@ -3,6 +3,12 @@ variable "name_prefix" {
   type        = string
 }
 
+variable "component" {
+  description = "Optional name part, e.g. \"backend\" -> <name_prefix>-backend-cluster. Empty keeps the Phase 1 names."
+  type        = string
+  default     = ""
+}
+
 variable "aws_region" {
   description = "Region (used by the awslogs log driver)."
   type        = string
@@ -39,6 +45,28 @@ variable "s3_prefix_list_id" {
   type        = string
 }
 
+variable "additional_egress_rules" {
+  description = <<-EOT
+    Extra egress rules for the tasks SG, on top of VPC endpoints + S3.
+    Give exactly one destination per rule: cidr_ipv4 OR referenced_security_group_id.
+    Example (frontend -> backend internal ALB): { description = "...", port = 80, cidr_ipv4 = "10.20.0.0/16" }
+  EOT
+  type = list(object({
+    description                  = string
+    port                         = number
+    cidr_ipv4                    = optional(string)
+    referenced_security_group_id = optional(string)
+  }))
+  default = []
+
+  validation {
+    condition = alltrue([
+      for r in var.additional_egress_rules : (r.cidr_ipv4 == null) != (r.referenced_security_group_id == null)
+    ])
+    error_message = "Each additional egress rule needs exactly one of cidr_ipv4 or referenced_security_group_id."
+  }
+}
+
 variable "target_group_arn" {
   description = "ALB target group the service registers tasks in."
   type        = string
@@ -53,6 +81,12 @@ variable "container_image" {
 variable "container_port" {
   description = "Port the container listens on."
   type        = number
+}
+
+variable "environment_variables" {
+  description = "Extra env vars for the container (e.g. BACKEND_URL). Merged over the defaults APP_ENV and APP_NAME."
+  type        = map(string)
+  default     = {}
 }
 
 variable "task_cpu" {
