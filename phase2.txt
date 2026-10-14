@@ -1,0 +1,148 @@
+===============================================================================
+ PHASE 2 PLAN - Multi-VPC: public frontend + private backend (VPC peering)
+ Branch: Phase2
+===============================================================================
+
+GOAL
+----
+The user opens the FRONTEND in the browser. The frontend calls the BACKEND,
+which lives in a second, isolated VPC with no internet. The page shows info
+from both sides plus a random quote from the backend - proving traffic
+crossed the VPC peering connection.
+
+  Browser
+     | http
+     v
+  +------------------- VPC A 10.10.0.0/16 (frontend layer) -------------------+
+  |  Public ALB --> FRONTEND (2 tasks, AZ 1a + 1b)                           |
+  |                   | GET /api/quote , GET /api/whoami                     |
+  +-------------------|-------------------------------------------------------+
+                      |  VPC Peering (private AWS network)
+  +-------------------|------ VPC B 10.20.0.0/16 (backend, NO internet) -----+
+  |                   v                                                      |
+  |  Internal ALB --> BACKEND API (2 tasks, AZ 1a + 1b) --logs--> CloudWatch |
+  +--------------------------------------------------------------------------+
+
+
+===============================================================================
+ PART 1 - CORE PHASE 2 (we build this now)
+===============================================================================
+
+1. APPLICATIONS
+---------------
+BACKEND (new, VPC B, JSON only, private)
+  GET /health        -> health check for the internal ALB
+  GET /api/whoami    -> backend hostname, IP, AZ, task ID
+  GET /api/quote     -> a RANDOM quote on every call
+  Quotes come from app/backend/quotes.txt (one per line: "text | author"),
+  packaged inside the image. No internet, no database.
+  To add quotes: edit quotes.txt -> build new image tag -> deploy.
+
+FRONTEND (Phase 1 app, extended, VPC A)
+  GET /              -> HTML page with:
+                          - Frontend box (IP, AZ, task)
+                          - Backend box  (IP, AZ, task)
+                          - Random quote (new one on every refresh)
+                          - "Backend call OK - 12 ms" status line
+  GET /health        -> health check for the public ALB
+  Backend address comes from env var BACKEND_URL (internal ALB DNS name).
+  2-second timeout: if the backend is down the page still loads and shows
+  a red "Backend unreachable" box (graceful degradation).
+
+2. INFRASTRUCTURE (reuse Phase 1 modules, called once per layer)
+---------------------------------------------------------------
+  network   VPC A as today. VPC B 10.20.0.0/16 with PRIVATE subnets only
+            (no IGW, no public subnets) -> module gets that option.
+  endpoints VPC B gets its own ecr.api, ecr.dkr, logs, s3 endpoints.
+  peering   NEW module: A <-> B connection + routes in BOTH private route
+            tables only (public subnets / public ALB cannot reach VPC B).
+  ecr       two repos: adom-demo-dev-frontend, adom-demo-dev-backend
+  iam       two execution roles, each pulls only its own repo and writes
+            only its own log group. Task roles: no permissions.
+  logs      /ecs/adom-demo-dev/frontend , /ecs/adom-demo-dev/backend
+  alb       public ALB (VPC A) + INTERNAL ALB (VPC B) -> module gets
+            an "internal" option.
+  ecs       frontend service (VPC A) + backend service (VPC B); module gets
+            env vars + configurable ingress/egress.
+  security  Security groups across the VPCs -> DECIDED IN STEP 6
+            (who exactly may enter the internal ALB / backend tasks).
+
+3. PROJECT LAYOUT CHANGES
+------------------------
+  app/frontend/          Phase 1 app moved here + backend call + quote box
+  app/backend/           NEW: app.py, quotes.txt, requirements.txt, Dockerfile
+  terraform/modules/     network, alb, ecs made reusable; NEW peering module
+  terraform/main.tf      frontend + backend module calls, peering
+  terraform.tfvars       new: vpc_b_cidr, VPC B subnets, backend settings
+  scripts/deploy.ps1     builds + pushes 2 images
+  tests/                 Phase 2 tests
+
+4. ORDER OF WORK (step by step, test after each)
+-----------------------------------------------
+  Step 1  Backend app + Dockerfile                -> run locally in Docker
+  Step 2  Frontend app update                     -> run BOTH locally
+                                                     (docker compose)
+  Step 3  Make modules reusable                   -> plan: Phase 1 must
+                                                     show NO changes
+  Step 4  VPC B + peering + routes                -> plan
+  Step 5  Backend layer (ECR, IAM, internal ALB,  -> plan
+          ECS)
+  Step 6  Security groups between the VPCs        -> your decision + plan
+  Step 7  deploy.ps1 for 2 images                 -> -
+  Step 8  Full deploy + tests                     -> see below
+  (Before each next step: ask whether to update CLAUDE.md.)
+
+5. TESTS (step 8)
+-----------------
+  OK  Page shows frontend + backend boxes; both change AZ on refresh
+  OK  A different quote on every refresh
+  NO  Backend cannot be reached from the internet
+  NO  Backend cannot reach the internet
+  NO  Public ALB / public subnets cannot reach VPC B; only frontend tasks
+  OK  Backend stopped -> page shows "Backend unreachable", no crash
+  OK  Drift check: terraform plan = "No changes"
+
+6. COST WHILE RUNNING
+---------------------
+  Phase 1 ~$0.09/h + VPC B endpoints ~$0.06/h + internal ALB ~$0.02/h
+  + 2 backend tasks ~$0.02/h  =  ~$0.19/hour (~$4.50/day).
+  Destroy when not demoing.
+
+
+===============================================================================
+ PART 2 - BONUS (ONLY after Phase 2 core is finished AND you say "go")
+===============================================================================
+
+B1. QUOTES IN A DATABASE WITH LIKE COUNTS
+  Move quotes from quotes.txt into a database, each quote with a like count:
+    { id, text, author, likes }
+  Options (decide then):
+    - DynamoDB (recommended): atomic "likes + 1", safe when 2 tasks write
+      at once; free Gateway endpoint (no internet needed).
+    - S3 JSON file: simple, but two likes at the same time can overwrite
+      each other.
+  Backend task role gets ONLY read/update on that one table/bucket.
+
+B2. LIKE BUTTON -> CLOUDWATCH ALERT
+  Frontend: [ Like ] button under the quote, shows the like count.
+  Flow: click -> frontend POST /like -> backend POST /api/quotes/<id>/like
+        -> likes + 1 in the DB -> backend writes log line "QUOTE_LIKED"
+        -> CloudWatch metric filter -> metric "QuoteLikes"
+        -> CloudWatch Alarm -> (optional) SNS email to you.
+  Backend needs no CloudWatch permissions - it only writes a log line.
+
+B3. EDIT A QUOTE (frontend input + backend API)
+  Frontend: text input + [ Save ] button to change the shown quote.
+  Backend API: PUT /api/quotes/<id>  { "text": "...", "author": "..." }
+  Saved in the DB, so the change is shared by all tasks and survives
+  restarts (a txt file inside the image can't do this: read-only file
+  system, and each task has its own copy).
+  Input validation: max length, no empty text.
+
+
+===============================================================================
+ OPEN DECISIONS
+===============================================================================
+  - Step 6: security between the VPCs (network only, or network + API key)
+  - Bonus:  DynamoDB or S3; email notification yes/no (and which address)
+===============================================================================
