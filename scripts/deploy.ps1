@@ -1,23 +1,29 @@
 <#
 .SYNOPSIS
-    One-command deploy (or destroy) of the Phase 1 stack: ECR -> image -> everything else.
+    One-command deploy (or destroy) of the Phase 2 stack: 2 ECR repos -> 2 images -> everything else.
 
 .DESCRIPTION
     Runs the bootstrap order the stack needs, because ECS can't start tasks
     from an image that isn't in ECR yet:
 
       1. Preflight   - tools on PATH, Docker running, AWS credentials valid
-      2. ECR only    - terraform apply -target=module.ecr
-      3. Image       - build + push <repo>:<tag> (skipped if the tag already exists;
-                       tags are immutable, so a re-push would fail anyway)
-      4. Everything  - terraform apply (waits until the ECS tasks are healthy)
-      5. Smoke test  - /health via the ALB, then requests grouped by AZ
+      2. ECR only    - terraform apply -target=module.ecr_frontend -target=module.ecr_backend
+      3. Images      - build + push the frontend AND the backend image
+                       (each skipped if its tag already exists; tags are
+                       immutable, so a re-push would fail anyway)
+      4. Everything  - terraform apply (waits until both ECS services are healthy)
+      5. Smoke test  - frontend /health via the public ALB, then /api/status 10x:
+                       backend answered every time (= traffic crossed the peering),
+                       AZs of frontend and backend; backend URL NOT reachable from here
       6. Drift check - terraform plan must report "No changes"
 
-.PARAMETER ImageTag
-    Image tag to build/deploy. Defaults to image_tag in terraform.tfvars.
+.PARAMETER FrontendTag
+    Frontend image tag to build/deploy. Defaults to frontend_image_tag in terraform.tfvars.
     A different value is passed to Terraform with -var, so tfvars stays the
     default and this run deploys the given tag.
+
+.PARAMETER BackendTag
+    Backend image tag to build/deploy. Defaults to backend_image_tag in terraform.tfvars.
 
 .PARAMETER AutoApprove
     Skip Terraform's "yes" prompts. Without it, every apply/destroy shows its
@@ -27,17 +33,19 @@
     Tear the whole stack down (terraform destroy) instead of deploying.
 
 .EXAMPLE
-    .\scripts\deploy.ps1                       # deploy, confirm each apply
-    .\scripts\deploy.ps1 -AutoApprove          # deploy without prompts
-    .\scripts\deploy.ps1 -ImageTag v1.0.1      # build/push/deploy a new version
-    .\scripts\deploy.ps1 -Destroy              # tear everything down
+    .\scripts\deploy.ps1                          # deploy, confirm each apply
+    .\scripts\deploy.ps1 -AutoApprove             # deploy without prompts
+    .\scripts\deploy.ps1 -BackendTag v1.0.1       # new backend version (e.g. after editing quotes.txt)
+    .\scripts\deploy.ps1 -FrontendTag v1.0.1      # new frontend version
+    .\scripts\deploy.ps1 -Destroy                 # tear everything down
 
     If scripts are blocked on this machine:
     powershell -ExecutionPolicy Bypass -File .\scripts\deploy.ps1
 #>
 [CmdletBinding()]
 param(
-    [string]$ImageTag,
+    [string]$FrontendTag,
+    [string]$BackendTag,
     [switch]$AutoApprove,
     [switch]$Destroy
 )
@@ -46,7 +54,6 @@ $ErrorActionPreference = 'Stop'
 
 $Root         = Split-Path -Parent $PSScriptRoot
 $TerraformDir = Join-Path $Root 'terraform'
-$AppDir       = Join-Path $Root 'app\frontend'
 $TfVarsFile   = Join-Path $TerraformDir 'terraform.tfvars'
 
 # --------------------------------------------------------------------------
@@ -90,6 +97,93 @@ function Get-TfVar([string]$Name) {
     return $line.Matches[0].Groups[1].Value
 }
 
+# Build + push one image to its ECR repo. Skipped if the tag is already there.
+function Publish-Image([string]$Name, [string]$Repo, [string]$Tag, [string]$AppDir) {
+    $registry = $Repo.Split('/')[0]
+    $repoName = $Repo.Split('/')[1]
+    $image    = "${Repo}:${Tag}"
+
+    $tagExists = Test-NativeCommand {
+        aws ecr describe-images --region $region --repository-name $repoName --image-ids "imageTag=$Tag"
+    }
+    if ($tagExists) {
+        Write-Ok "$Name tag $Tag already in ECR - skipping build/push (tags are immutable; use -${Name}Tag for a new version)"
+        return
+    }
+
+    # Run the pipe in cmd: PowerShell 5.1 re-encodes piped text, which
+    # corrupts the token and makes the login fail with 400 Bad Request.
+    cmd /c "aws ecr get-login-password --region $region | docker login --username AWS --password-stdin $registry"
+    Assert-ExitCode 'docker login to ECR'
+
+    # linux/amd64 = Fargate's default CPU architecture.
+    # --provenance/--sbom=false = push one plain image manifest; otherwise
+    # the real image is stored untagged and the ECR lifecycle rule
+    # ("expire untagged after 1 day") would delete it.
+    docker build --platform linux/amd64 --provenance=false --sbom=false -t $image $AppDir
+    Assert-ExitCode "docker build ($Name)"
+
+    docker push $image
+    Assert-ExitCode "docker push ($Name)"
+    Write-Ok "Pushed $image"
+}
+
+# Smoke test of the running stack, through the public ALB only:
+#   - frontend /health
+#   - /api/status 10x: the frontend calls the backend (VPC A -> peering -> VPC B)
+#   - the backend URL must NOT be reachable from this PC
+# Throws on any failure. $Retries x 5 s = how long to wait for new ALBs.
+function Invoke-SmokeTest([string]$AppUrl, [string]$BackendUrl, [int]$Retries = 24) {
+    # A brand-new ALB's DNS name can take a minute to resolve.
+    $healthy = $false
+    for ($i = 1; $i -le $Retries -and -not $healthy; $i++) {
+        try {
+            $r = Invoke-WebRequest "$AppUrl/health" -UseBasicParsing -TimeoutSec 5
+            $healthy = ($r.StatusCode -eq 200)
+        }
+        catch {
+            Start-Sleep -Seconds 5
+        }
+    }
+    if (-not $healthy) { throw "Public ALB did not answer $AppUrl/health after $Retries tries." }
+    Write-Ok 'Frontend /health returned 200'
+
+    # /api/status = the frontend calls the backend (VPC A -> peering -> VPC B).
+    # Wait until the first backend call works (internal ALB DNS can lag too).
+    $backendOk = $false
+    for ($i = 1; $i -le $Retries -and -not $backendOk; $i++) {
+        try {
+            $s = (Invoke-WebRequest "$AppUrl/api/status" -UseBasicParsing -TimeoutSec 10).Content | ConvertFrom-Json
+            $backendOk = [bool]$s.backend.ok
+        }
+        catch { }
+        if (-not $backendOk) { Start-Sleep -Seconds 5 }
+    }
+    if (-not $backendOk) { throw "Frontend could not reach the backend after $Retries tries: $($s.backend.error)" }
+
+    $answers = 1..10 | ForEach-Object {
+        (Invoke-WebRequest "$AppUrl/api/status" -UseBasicParsing -TimeoutSec 10).Content | ConvertFrom-Json
+    }
+    $failed = @($answers | Where-Object { -not $_.backend.ok }).Count
+    if ($failed -gt 0) { throw "$failed of 10 backend calls failed." }
+    Write-Ok '10 of 10 backend calls OK (frontend -> peering -> internal ALB -> backend)'
+    $answers | Group-Object { $_.frontend.'Availability Zone' } | ForEach-Object {
+        Write-Ok ("frontend: {0} requests -> {1}" -f $_.Count, $(if ($_.Name) { $_.Name } else { "unknown AZ" }))
+    }
+    $answers | Group-Object { $_.backend.data.served_by.'Availability Zone' } | ForEach-Object {
+        Write-Ok ("backend:  {0} requests -> {1}" -f $_.Count, $(if ($_.Name) { $_.Name } else { "unknown AZ" }))
+    }
+    $quotes = @($answers | ForEach-Object { $_.backend.data.quote.id } | Sort-Object -Unique).Count
+    Write-Ok "$quotes different quotes in 10 calls"
+
+    # Negative check: the internal ALB has private IPs only - this PC can't reach it.
+    $reachable = $true
+    try { Invoke-WebRequest "$BackendUrl/health" -UseBasicParsing -TimeoutSec 5 | Out-Null }
+    catch { $reachable = $false }
+    if ($reachable) { throw "Backend $BackendUrl answered from the internet - it must be private!" }
+    Write-Ok 'Backend NOT reachable from this PC (internal ALB, private IPs only)'
+}
+
 $approveArgs = @()
 if ($AutoApprove) { $approveArgs = @('-auto-approve') }
 
@@ -114,9 +208,10 @@ Assert-ExitCode 'AWS credentials check (run "aws configure")'
 Write-Ok "AWS account $account"
 
 $region = Get-TfVar 'aws_region'
-if (-not $ImageTag) { $ImageTag = Get-TfVar 'image_tag' }
-$tagArgs = @("-var=image_tag=$ImageTag")
-Write-Ok "Region $region, image tag $ImageTag"
+if (-not $FrontendTag) { $FrontendTag = Get-TfVar 'frontend_image_tag' }
+if (-not $BackendTag)  { $BackendTag  = Get-TfVar 'backend_image_tag' }
+$tagArgs = @("-var=frontend_image_tag=$FrontendTag", "-var=backend_image_tag=$BackendTag")
+Write-Ok "Region $region, frontend tag $FrontendTag, backend tag $BackendTag"
 
 Push-Location $TerraformDir
 try {
@@ -131,7 +226,7 @@ try {
         Write-Step 'Destroying the whole stack'
         terraform destroy -input=false @tagArgs @approveArgs
         Assert-ExitCode 'terraform destroy'
-        Write-Ok 'Everything destroyed. The ECR image was deleted with the repository.'
+        Write-Ok 'Everything destroyed. The ECR images were deleted with the repositories.'
         return
     }
 
@@ -142,85 +237,44 @@ try {
     Write-Ok 'Docker running'
 
     # ----------------------------------------------------------------------
-    # 2. ECR repository only
+    # 2. ECR repositories only
     # ----------------------------------------------------------------------
-    Write-Step 'Step 1/5: Create the ECR repository (terraform apply -target=module.ecr)'
-    # Quoted: PowerShell would otherwise split "-target=module.ecr" at the dot.
-    terraform apply -input=false "-target=module.ecr" @tagArgs @approveArgs
+    Write-Step 'Step 1/5: Create the 2 ECR repositories (terraform apply -target=...)'
+    # Quoted: PowerShell would otherwise split "-target=module.ecr_..." at the dot.
+    terraform apply -input=false "-target=module.ecr_frontend" "-target=module.ecr_backend" @tagArgs @approveArgs
     Assert-ExitCode 'terraform apply (ECR)'
 
-    $repo = terraform output -raw ecr_repository_url
-    Assert-ExitCode 'terraform output ecr_repository_url'
-    $registry = $repo.Split('/')[0]
-    $repoName = $repo.Split('/')[1]
-    $image    = "${repo}:${ImageTag}"
-    Write-Ok "Repository $repo"
+    $frontendRepo = terraform output -raw frontend_ecr_repository_url
+    Assert-ExitCode 'terraform output frontend_ecr_repository_url'
+    $backendRepo = terraform output -raw backend_ecr_repository_url
+    Assert-ExitCode 'terraform output backend_ecr_repository_url'
+    Write-Ok "Repositories $frontendRepo, $backendRepo"
 
     # ----------------------------------------------------------------------
-    # 3. Build + push the image (skip if this tag is already in ECR)
+    # 3. Build + push both images
     # ----------------------------------------------------------------------
-    Write-Step "Step 2/5: Build and push $image"
-
-    $tagExists = Test-NativeCommand {
-        aws ecr describe-images --region $region --repository-name $repoName --image-ids "imageTag=$ImageTag"
-    }
-
-    if ($tagExists) {
-        Write-Ok "Tag $ImageTag already in ECR - skipping build/push (tags are immutable; use -ImageTag for a new version)"
-    }
-    else {
-        # Run the pipe in cmd: PowerShell 5.1 re-encodes piped text, which
-        # corrupts the token and makes the login fail with 400 Bad Request.
-        cmd /c "aws ecr get-login-password --region $region | docker login --username AWS --password-stdin $registry"
-        Assert-ExitCode 'docker login to ECR'
-
-        # linux/amd64 = Fargate's default CPU architecture.
-        # --provenance/--sbom=false = push one plain image manifest; otherwise
-        # the real image is stored untagged and the ECR lifecycle rule
-        # ("expire untagged after 1 day") would delete it.
-        docker build --platform linux/amd64 --provenance=false --sbom=false -t $image $AppDir
-        Assert-ExitCode 'docker build'
-
-        docker push $image
-        Assert-ExitCode 'docker push'
-        Write-Ok "Pushed $image"
-    }
+    Write-Step 'Step 2/5: Build and push the frontend and backend images'
+    Publish-Image -Name 'Frontend' -Repo $frontendRepo -Tag $FrontendTag -AppDir (Join-Path $Root 'app\frontend')
+    Publish-Image -Name 'Backend'  -Repo $backendRepo  -Tag $BackendTag  -AppDir (Join-Path $Root 'app\backend')
 
     # ----------------------------------------------------------------------
     # 4. Everything else
     # ----------------------------------------------------------------------
-    Write-Step 'Step 3/5: Deploy everything (terraform apply) - waits for healthy ECS tasks, ~4 min'
+    Write-Step 'Step 3/5: Deploy everything (terraform apply) - waits for both ECS services to be healthy, ~6 min'
     terraform apply -input=false @tagArgs @approveArgs
     Assert-ExitCode 'terraform apply'
 
     $appUrl = terraform output -raw app_url
     Assert-ExitCode 'terraform output app_url'
+    $backendUrl = terraform output -raw backend_url
+    Assert-ExitCode 'terraform output backend_url'
 
     # ----------------------------------------------------------------------
-    # 5. Smoke test through the ALB
+    # 5. Smoke test through the public ALB
     # ----------------------------------------------------------------------
     Write-Step "Step 4/5: Smoke test $appUrl"
 
-    # A brand-new ALB's DNS name can take a minute to resolve.
-    $healthy = $false
-    for ($i = 1; $i -le 24 -and -not $healthy; $i++) {
-        try {
-            $r = Invoke-WebRequest "$appUrl/health" -UseBasicParsing -TimeoutSec 5
-            $healthy = ($r.StatusCode -eq 200)
-        }
-        catch {
-            Start-Sleep -Seconds 5
-        }
-    }
-    if (-not $healthy) { throw "ALB did not answer $appUrl/health within 2 minutes." }
-    Write-Ok '/health returned 200'
-
-    $answers = 1..10 | ForEach-Object {
-        (Invoke-WebRequest "$appUrl/api/whoami" -UseBasicParsing -TimeoutSec 5).Content | ConvertFrom-Json
-    }
-    $answers | Group-Object { $_.'Availability Zone' } | ForEach-Object {
-        Write-Ok ("{0} requests -> {1}" -f $_.Count, $_.Name)
-    }
+    Invoke-SmokeTest -AppUrl $appUrl -BackendUrl $backendUrl
 
     # ----------------------------------------------------------------------
     # 6. Drift check
@@ -235,7 +289,7 @@ try {
 
     Write-Host ''
     Write-Host "Deployed. Open in your browser (type http:// explicitly): $appUrl" -ForegroundColor Green
-    Write-Host 'Running cost is about $0.09/hour - tear down with: .\scripts\deploy.ps1 -Destroy' -ForegroundColor Yellow
+    Write-Host 'Running cost is about $0.19/hour - tear down with: .\scripts\deploy.ps1 -Destroy' -ForegroundColor Yellow
 }
 finally {
     Pop-Location

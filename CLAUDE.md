@@ -47,8 +47,8 @@ routes in private route tables only; second ECR repo / IAM role / log group / in
 | 4 | VPC B + peering + routes | ✅ Done – plan only (57 to add); Phase 1 resources identical; overlap check proven |
 | 5 | Backend layer (ECR, IAM, internal ALB, ECS) | ✅ Done – plan only (75 to add); Phase 1 resources renamed to `frontend` |
 | 6 | Security groups between the VPCs (network only) | ✅ Done – plan only (77 to add); only 2 rules cross the VPCs |
-| 7 | `deploy.ps1` for 2 images | ⏳ Next |
-| 8 | Full deploy + tests | ⬜ |
+| 7 | `deploy.ps1` for 2 images | ✅ Done – parse check, plan of each Terraform command, smoke test tested locally |
+| 8 | Full deploy + tests | ⏳ Next |
 
 ### Backend API (Phase 2 Step 1)
 
@@ -226,7 +226,7 @@ The same 4 modules (ecr, iam, alb, ecs) + a log group are now used **once per la
   `..._ecs_cluster_name`, `..._ecs_service_name`, `frontend_tasks_security_group_id`,
   `backend_alb_security_group_id`. (`ecr_repository_url`, `log_group_name`, IAM role ARN outputs removed.)
 - After Step 5 the internal ALB had **no ingress rule** → nobody could call it (fixed in Step 6).
-- **`scripts/deploy.ps1` is broken until Step 7** (still uses `module.ecr`, `image_tag`, `ecr_repository_url`).
+- `scripts/deploy.ps1` was broken between Step 5 and Step 7 (old names) – fixed in Step 7.
 
 **Tests (plan only, 2026-10-14):**
 
@@ -334,10 +334,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\deploy.ps1
 ```
 
 Terraform stops **2 times** and asks `Enter a value:` – type **`yes`** and press Enter.
-It takes about **6–8 minutes**. At the end it prints the **link to your app**.
+It takes about **8–10 minutes**. At the end it prints the **link to your app**.
 Open it in the browser and type `http://` at the start (not `https://`).
 
-### Delete everything when you finish (stops the cost, ~$0.09/hour)
+### Delete everything when you finish (stops the cost, ~$0.19/hour)
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\deploy.ps1 -Destroy
@@ -354,23 +354,24 @@ Type **`yes`** when it asks.
  ① CHECK     Is Terraform installed? Docker running? AWS login OK?
               │   (if something is missing → it stops and tells you what)
               ▼
- ② ECR       terraform apply "-target=module.ecr"
-              │   Creates ONLY the empty image storage (ECR). Nothing else.
+ ② ECR       terraform apply "-target=module.ecr_frontend" "-target=module.ecr_backend"
+              │   Creates ONLY the 2 empty image storages (ECR). Nothing else.
               ▼
- ③ IMAGE     docker build + docker push
-              │   Builds the app image and uploads it into ECR.
-              │   (skipped if this image tag is already in ECR)
+ ③ IMAGES    docker build + docker push – frontend AND backend
+              │   (each one skipped if its tag is already in ECR)
               ▼
  ④ DEPLOY    terraform apply
-              │   Creates everything else: network, IAM, load balancer, containers.
-              │   ECR already exists, so Terraform does not create it again.
-              │   Waits until the 2 containers are healthy (~4 min).
+              │   Creates everything else: 2 VPCs, peering, IAM, 2 load balancers, containers.
+              │   Waits until the 4 containers (2 frontend + 2 backend) are healthy.
               ▼
- ⑤ TEST      Opens the app 10 times → shows how many answers came from each AZ
+ ⑤ TEST      Frontend /health → 200
+              │   /api/status 10x → all 10 backend calls OK (= traffic crossed the peering),
+              │   which AZ answered (frontend + backend), how many different quotes
+              │   Backend URL from your PC → must NOT answer (it's private)
               ▼
  ⑥ CHECK     terraform plan → must say "No changes" (code and AWS match)
               ▼
- ✅ Prints your link:  http://adom-demo-dev-alb-....amazonaws.com
+ ✅ Prints your link:  http://adom-demo-dev-frontend-alb-....amazonaws.com
 ```
 
 ### Why this order? (the most important part)
@@ -378,19 +379,24 @@ Type **`yes`** when it asks.
 The containers need the image **before** they start. If you run one plain `terraform apply`,
 Terraform creates everything at once – the containers start, but **ECR is still empty**, so they fail.
 
-`-target=module.ecr` means: **"read all of `main.tf`, but create ONLY the ECR part."**
+`-target=module.ecr_frontend` means: **"read all of `main.tf`, but create ONLY this part."**
 
 ```
-main.tf                      Step ② (-target)     Step ④ (normal apply)
- ├── module "network"         ⏸ skipped            ✅ created
- ├── module "ecr"             ✅ CREATED           ✔ already exists – no change
- ├── module "iam"             ⏸ skipped            ✅ created
- ├── module "alb"             ⏸ skipped            ✅ created
- └── module "ecs"             ⏸ skipped            ✅ created (image is already in ECR)
+main.tf                         Step ② (-target)     Step ④ (normal apply)
+ ├── network_frontend/backend    ⏸ skipped            ✅ created
+ ├── peering                     ⏸ skipped            ✅ created
+ ├── ecr_frontend, ecr_backend   ✅ CREATED           ✔ already exist – no change
+ ├── iam_frontend, iam_backend   ⏸ skipped            ✅ created
+ ├── alb_frontend, alb_backend   ⏸ skipped            ✅ created
+ └── ecs_frontend, ecs_backend   ⏸ skipped            ✅ created (images are already in ECR)
 ```
 
 Like a restaurant: **first** build the fridge (ECR), **then** put the food inside (push the image),
 **then** open the kitchen (ECS) – the cooks find food in the fridge right away.
+
+The smoke test is a function (`Invoke-SmokeTest`). It was tested locally against `docker compose`
+before any AWS run: both up → pass; backend stopped → fails "Timeout"; frontend down → fails;
+backend answering from outside → fails "must be private".
 
 ### Options
 
@@ -399,7 +405,8 @@ Like a restaurant: **first** build the fridge (ECR), **then** put the food insid
 | `.\scripts\deploy.ps1` | Deploy. Asks you to type `yes` before creating things |
 | `.\scripts\deploy.ps1 -AutoApprove` | Deploy without asking `yes` (needed when running from Claude Code with `!`) |
 | `.\scripts\deploy.ps1 -Destroy` | Delete everything from AWS |
-| `.\scripts\deploy.ps1 -ImageTag v1.0.1` | Build, upload and deploy a **new version** of the app (tags can't be reused) |
+| `.\scripts\deploy.ps1 -BackendTag v1.0.1` | New **backend** version (e.g. after editing `quotes.txt`). Tags can't be reused |
+| `.\scripts\deploy.ps1 -FrontendTag v1.0.1` | New **frontend** version |
 | `Get-Help .\scripts\deploy.ps1 -Full` | Show the built-in help |
 
 (Add `powershell -ExecutionPolicy Bypass -File` in front if Windows blocks scripts.)
@@ -721,9 +728,9 @@ aws iam simulate-principal-policy --policy-source-arn <execution-role-arn> --act
   rebuilding once Debian ships patches, or add `apt-get upgrade` in the Dockerfile.
 - **Environment is currently destroyed** (cost saving). Recreate with `.\scripts\deploy.ps1`
   (`ecr_force_delete = true` deleted the image with the repo; the script pushes it again).
-- **`scripts/deploy.ps1` doesn't work on branch `Phase2` yet** – old module/variable/output names;
-  rewritten for 2 images in Phase 2 Step 7.
-- **`scripts/deploy.ps1` deploy path not yet run end to end** – only its `-Destroy` path (on empty
+- **`scripts/deploy.ps1` (Phase 2 version) not yet run against AWS** – tested: parse check, plans of its
+  Terraform commands, smoke test locally. First real run = Phase 2 Step 8.
+- **Phase 1 `scripts/deploy.ps1` deploy path was never run end to end** – only its `-Destroy` path (on empty
   state) and helper functions were tested. Parse check passed on Windows PowerShell 5.1.
 - **HTTPS:** HTTP-only for the demo. Production: ACM certificate + 443 listener + 80→443 redirect.
 - **Possible hardening later:** ALB access logs to S3, VPC Flow Logs, WAF on the ALB, ECS Exec
