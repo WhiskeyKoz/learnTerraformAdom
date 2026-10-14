@@ -16,6 +16,11 @@ availability_zones   = ["eu-central-1a", "eu-central-1b"]
 public_subnet_cidrs  = ["10.10.1.0/24", "10.10.2.0/24"]
 private_subnet_cidrs = ["10.10.11.0/24", "10.10.12.0/24"]
 
+# Networking - VPC B (Phase 2 backend: private subnets only, no internet)
+# Must not overlap vpc_cidr above - checked at plan time by the peering module.
+vpc_b_cidr                 = "10.20.0.0/16"
+vpc_b_private_subnet_cidrs = ["10.20.11.0/24", "10.20.12.0/24"]
+
 # Container registry (ECR)
 ecr_force_delete    = true # dev/demo only - lets `terraform destroy` remove a repo with images
 ecr_max_image_count = 10

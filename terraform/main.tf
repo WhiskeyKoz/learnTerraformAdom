@@ -1,10 +1,12 @@
 # ---------------------------------------------------------------------------
 # Root module: wires the child modules together.
-#   module "network" - VPC, subnets, IGW, route tables, VPC endpoints
-#   module "ecr"     - image repository
-#   module "iam"     - task execution role + task role (+ app log group here)
-#   module "alb"     - public ALB, target group, listener
-#   module "ecs"     - cluster, task definition, service
+#   module "network_frontend" - VPC A: public + private subnets, IGW, endpoints
+#   module "network_backend"  - VPC B: private subnets only, no IGW, endpoints
+#   module "peering"          - VPC A <-> VPC B + routes (private RTs only)
+#   module "ecr"              - image repository
+#   module "iam"              - task execution role + task role (+ app log group here)
+#   module "alb"              - public ALB, target group, listener
+#   module "ecs"              - cluster, task definition, service
 # ---------------------------------------------------------------------------
 
 locals {
@@ -12,7 +14,12 @@ locals {
   name_prefix = "${var.project_name}-${var.environment}"
 }
 
-module "network" {
+# ---------------------------------------------------------------------------
+# Networking
+# ---------------------------------------------------------------------------
+
+# VPC A - frontend / ingress layer.
+module "network_frontend" {
   source = "./modules/network"
 
   name_prefix          = local.name_prefix
@@ -21,6 +28,42 @@ module "network" {
   availability_zones   = var.availability_zones
   public_subnet_cidrs  = var.public_subnet_cidrs
   private_subnet_cidrs = var.private_subnet_cidrs
+}
+
+# Renamed from "network" in Phase 2 - same objects, nothing is recreated.
+moved {
+  from = module.network
+  to   = module.network_frontend
+}
+
+# VPC B - isolated backend layer: private subnets only, no Internet Gateway,
+# no route to the internet. Its VPC endpoints (ECR, S3, Logs) let the
+# backend pull images and ship logs anyway.
+module "network_backend" {
+  source = "./modules/network"
+
+  name_prefix           = "${local.name_prefix}-backend"
+  aws_region            = var.aws_region
+  vpc_cidr              = var.vpc_b_cidr
+  availability_zones    = var.availability_zones
+  create_public_subnets = false
+  private_subnet_cidrs  = var.vpc_b_private_subnet_cidrs
+}
+
+# VPC A <-> VPC B. Routes go into the PRIVATE route tables only: frontend
+# tasks can reach VPC B, the public subnets (public ALB) cannot.
+module "peering" {
+  source = "./modules/peering"
+
+  name_prefix = local.name_prefix
+
+  requester_vpc_id       = module.network_frontend.vpc_id
+  requester_vpc_cidr     = module.network_frontend.vpc_cidr
+  requester_route_tables = { private = module.network_frontend.private_route_table_id }
+
+  accepter_vpc_id       = module.network_backend.vpc_id
+  accepter_vpc_cidr     = module.network_backend.vpc_cidr
+  accepter_route_tables = { private = module.network_backend.private_route_table_id }
 }
 
 module "ecr" {
@@ -56,8 +99,8 @@ module "alb" {
   source = "./modules/alb"
 
   name_prefix       = local.name_prefix
-  vpc_id            = module.network.vpc_id
-  subnet_ids        = module.network.public_subnet_ids
+  vpc_id            = module.network_frontend.vpc_id
+  subnet_ids        = module.network_frontend.public_subnet_ids
   ingress_cidrs     = var.alb_ingress_cidrs
   container_port    = var.container_port
   health_check_path = var.health_check_path
@@ -70,10 +113,10 @@ module "ecs" {
   aws_region  = var.aws_region
   environment = var.environment
 
-  vpc_id                          = module.network.vpc_id
-  private_subnet_ids              = module.network.private_subnet_ids
-  vpc_endpoints_security_group_id = module.network.vpc_endpoints_security_group_id
-  s3_prefix_list_id               = module.network.s3_prefix_list_id
+  vpc_id                          = module.network_frontend.vpc_id
+  private_subnet_ids              = module.network_frontend.private_subnet_ids
+  vpc_endpoints_security_group_id = module.network_frontend.vpc_endpoints_security_group_id
+  s3_prefix_list_id               = module.network_frontend.s3_prefix_list_id
   alb_security_group_id           = module.alb.alb_security_group_id
   target_group_arn                = module.alb.target_group_arn
 

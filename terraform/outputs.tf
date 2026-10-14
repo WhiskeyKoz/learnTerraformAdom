@@ -3,20 +3,36 @@ output "name_prefix" {
   value       = local.name_prefix
 }
 
-# --- Network ---------------------------------------------------------------
+# --- Network: VPC A (frontend) ---------------------------------------------
 output "vpc_id" {
-  description = "ID of the VPC."
-  value       = module.network.vpc_id
+  description = "ID of VPC A (frontend)."
+  value       = module.network_frontend.vpc_id
 }
 
 output "public_subnet_ids" {
-  description = "Public subnet IDs (ALB)."
-  value       = module.network.public_subnet_ids
+  description = "VPC A public subnet IDs (public ALB)."
+  value       = module.network_frontend.public_subnet_ids
 }
 
 output "private_subnet_ids" {
-  description = "Private subnet IDs (ECS tasks)."
-  value       = module.network.private_subnet_ids
+  description = "VPC A private subnet IDs (frontend ECS tasks)."
+  value       = module.network_frontend.private_subnet_ids
+}
+
+# --- Network: VPC B (backend) + peering -------------------------------------
+output "vpc_b_id" {
+  description = "ID of VPC B (backend, private-only)."
+  value       = module.network_backend.vpc_id
+}
+
+output "vpc_b_private_subnet_ids" {
+  description = "VPC B private subnet IDs (backend ECS tasks + internal ALB)."
+  value       = module.network_backend.private_subnet_ids
+}
+
+output "peering_connection_id" {
+  description = "VPC A <-> VPC B peering connection."
+  value       = module.peering.peering_connection_id
 }
 
 # --- ECR -------------------------------------------------------------------

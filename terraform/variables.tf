@@ -70,6 +70,30 @@ variable "private_subnet_cidrs" {
 }
 
 # ---------------------------------------------------------------------------
+# Networking - VPC B (Phase 2 backend: private-only, no internet)
+# Uses the same availability_zones as VPC A.
+# ---------------------------------------------------------------------------
+variable "vpc_b_cidr" {
+  description = "CIDR block for VPC B (backend). Must NOT overlap vpc_cidr, or VPC peering is impossible."
+  type        = string
+
+  validation {
+    condition     = can(cidrhost(var.vpc_b_cidr, 0))
+    error_message = "vpc_b_cidr must be a valid IPv4 CIDR block."
+  }
+}
+
+variable "vpc_b_private_subnet_cidrs" {
+  description = "CIDRs for VPC B's private subnets (backend tasks + internal ALB). One per AZ, same order as availability_zones."
+  type        = list(string)
+
+  validation {
+    condition     = length(var.vpc_b_private_subnet_cidrs) == 2 && alltrue([for c in var.vpc_b_private_subnet_cidrs : can(cidrhost(c, 0))])
+    error_message = "Provide exactly 2 valid private subnet CIDRs for VPC B."
+  }
+}
+
+# ---------------------------------------------------------------------------
 # Container registry (ECR)
 # ---------------------------------------------------------------------------
 variable "ecr_force_delete" {

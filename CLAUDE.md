@@ -44,8 +44,8 @@ Bonus – DynamoDB vs. S3, email yes/no.
 | 1 | Backend app (`app/backend`: API, `quotes.txt`, Dockerfile) | ✅ Done – tested locally in Docker |
 | 2 | Frontend app update (backend call, quote box, graceful degradation) + `docker compose` | ✅ Done – tested locally with `docker compose`, UI checked by user |
 | 3 | Make modules reusable (network w/o public subnets, internal ALB, flexible ECS) – Phase 1 plan must show no changes | ✅ Done – plan identical to Phase 1 (only 3 intended address moves), new options proven with a test config |
-| 4 | VPC B + peering + routes | ⏳ Next |
-| 5 | Backend layer (ECR, IAM, internal ALB, ECS) | ⬜ |
+| 4 | VPC B + peering + routes | ✅ Done – plan only (57 to add); Phase 1 resources identical; overlap check proven |
+| 5 | Backend layer (ECR, IAM, internal ALB, ECS) | ⏳ Next |
 | 6 | Security groups between the VPCs (user decision) | ⬜ |
 | 7 | `deploy.ps1` for 2 images | ⬜ |
 | 8 | Full deploy + tests | ⬜ |
@@ -155,6 +155,49 @@ internal ALB `internal = true`; SG ingress + extra egress rules; `BACKEND_URL` i
 `for_each = toset(...)`. A SG created in the same apply has an unknown ID at plan time →
 `Error: Invalid for_each argument`. Fixed by a `map` with static labels as keys
 (`{ frontend_tasks = sg_id }`). Retested with a not-yet-existing SG → plans fine.
+
+### VPC B + peering (Phase 2 Step 4)
+
+```
+┌──────── VPC A  10.10.0.0/16 ────────┐            ┌──────── VPC B  10.20.0.0/16 ────────┐
+│  public subnets  (public ALB)        │            │  (no public subnets, no IGW)          │
+│  private subnets (frontend)  ────────┼── PEERING ─┼──────── private subnets (backend)     │
+│  private RT: 10.20.0.0/16 → peering  │            │  private RT: 10.10.0.0/16 → peering   │
+│  public RT:  0.0.0.0/0 → IGW         │            │  NO route to the internet             │
+└──────────────────────────────────────┘            └───────────────────────────────────────┘
+```
+
+- **Root modules:** `network` renamed to **`network_frontend`** (root `moved` block → nothing recreated);
+  new **`network_backend`** (`create_public_subnets = false`, `name_prefix = adom-demo-dev-backend`)
+  and new **`peering`** module.
+- **VPC B:** `10.20.0.0/16`, private subnets `10.20.11.0/24` (1a) / `10.20.12.0/24` (1b), own VPC
+  endpoints (ecr.api, ecr.dkr, logs, s3) so the backend can pull images and log with no internet.
+- **`modules/peering`:** `aws_vpc_peering_connection` (`auto_accept = true` – same account + region,
+  name `adom-demo-dev-peering-a-b`) + one route per side. Route tables passed as
+  `{ label = route_table_id }` maps (static `for_each` keys – Step 3 lesson). Only the **private**
+  route tables are passed → the public subnets / public ALB have no route to VPC B.
+- **CIDR overlap check at plan time:** `lifecycle.precondition` on the peering connection. Two CIDRs
+  overlap if either contains the other's network address (mask it with the other's prefix length and
+  compare). AWS would only reject overlap during `apply`, possibly after other resources were created.
+- New tfvars: `vpc_b_cidr`, `vpc_b_private_subnet_cidrs` (validated). New outputs: `vpc_b_id`,
+  `vpc_b_private_subnet_ids`, `peering_connection_id`.
+- **Routes are the road, security groups are the gate:** the routes exist, but no SG rule allows
+  traffic between the VPCs yet – that's Step 6.
+- **Peering is not transitive:** VPC B can't use VPC A's IGW → backend stays isolated.
+- **Cost when applied:** peering free (same-AZ traffic free); VPC B endpoints ≈ $0.06/h.
+
+**Tests (plan only, 2026-10-14):**
+
+| Test | Result |
+|---|---|
+| Plan | 57 to add = 40 Phase 1 + 14 VPC B + 3 peering |
+| Phase 1 unchanged after rename | Plan compared with Step 3 plan (spacing ignored): only timing + summary lines differ |
+| VPC B private-only | 0 IGW, 0 public subnets, 0 `0.0.0.0/0` routes, `map_public_ip_on_launch = false` |
+| Peering routes | A → `10.20.0.0/16`, B → `10.10.0.0/16`, private RTs only (none in public RT) |
+| Overlap check | `10.10.0.0/16` and `10.10.128.0/17` blocked by the precondition; `10.0.0.0/8` blocked by AWS VPC size rule (/16–/28); `10.30.0.0/16` allowed. Formula verified in `terraform console` incl. "B contains A" |
+
+Note: those blocked plans are **intentional negative tests** (`-var vpc_b_cidr=...`); the real
+tfvars plan is clean (exit code 0).
 
 ### Interview notes: Terraform `for_each` keys
 
@@ -318,10 +361,11 @@ The manual commands the script runs are in **"Deploy from scratch"** below (for 
     ├── outputs.tf
     ├── .terraform.lock.hcl # provider version lock (committed)
     └── modules/            # each module: main.tf, variables.tf, outputs.tf
-        ├── network/        # VPC, subnets, IGW, route tables, VPC endpoints, SGs
+        ├── network/        # VPC, subnets, IGW (optional), route tables, VPC endpoints, SGs
+        ├── peering/        # VPC A <-> VPC B peering + routes + CIDR overlap check (Phase 2)
         ├── ecr/            # image repository + lifecycle policy
         ├── iam/            # ECS task execution role + task role
-        ├── alb/            # public ALB, target group, HTTP listener, ALB SG
+        ├── alb/            # public or internal ALB, target group, HTTP listener, ALB SG
         └── ecs/            # cluster, task definition, service, tasks SG
 ```
 
