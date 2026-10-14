@@ -46,7 +46,7 @@ $ErrorActionPreference = 'Stop'
 
 $Root         = Split-Path -Parent $PSScriptRoot
 $TerraformDir = Join-Path $Root 'terraform'
-$AppDir       = Join-Path $Root 'app'
+$AppDir       = Join-Path $Root 'app\frontend'
 $TfVarsFile   = Join-Path $TerraformDir 'terraform.tfvars'
 
 # --------------------------------------------------------------------------

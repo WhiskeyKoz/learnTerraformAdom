@@ -1,0 +1,38 @@
+# Local test of the Phase 2 flow: frontend -> backend, before any AWS work.
+#
+#   docker compose up --build -d     # start both
+#   open http://localhost:8080       # the page
+#   docker compose down              # stop + remove
+#
+# Mirrors the AWS design: only the frontend is published to the host; the
+# backend has NO published port, so (like VPC B) it is reachable only from
+# the frontend over the internal compose network.
+# Both containers run with the same hardening as the ECS task definition.
+
+x-hardening: &hardening
+  read_only: true            # = readonlyRootFilesystem
+  cap_drop: [ALL]            # = capabilities.drop ALL
+  security_opt:
+    - no-new-privileges:true
+  platform: linux/amd64
+
+services:
+  backend:
+    <<: *hardening
+    build: ./app/backend
+    image: adom-backend:local
+    environment:
+      APP_ENV: local-compose
+
+  frontend:
+    <<: *hardening
+    build: ./app/frontend
+    image: adom-frontend:local
+    ports:
+      - "8080:8080"
+    environment:
+      APP_ENV: local-compose
+      APP_NAME: Quote App
+      BACKEND_URL: http://backend:8080   # in AWS: the internal ALB DNS name
+    depends_on:
+      - backend

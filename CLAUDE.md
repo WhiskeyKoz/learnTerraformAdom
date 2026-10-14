@@ -42,8 +42,8 @@ Bonus – DynamoDB vs. S3, email yes/no.
 | Step | What | Status |
 |---|---|---|
 | 1 | Backend app (`app/backend`: API, `quotes.txt`, Dockerfile) | ✅ Done – tested locally in Docker |
-| 2 | Frontend app update (backend call, quote box, graceful degradation) + `docker compose` | ⏳ Next |
-| 3 | Make modules reusable (network w/o public subnets, internal ALB, flexible ECS) – Phase 1 plan must show no changes | ⬜ |
+| 2 | Frontend app update (backend call, quote box, graceful degradation) + `docker compose` | ✅ Done – tested locally with `docker compose`, UI checked by user |
+| 3 | Make modules reusable (network w/o public subnets, internal ALB, flexible ECS) – Phase 1 plan must show no changes | ⏳ Next |
 | 4 | VPC B + peering + routes | ⬜ |
 | 5 | Backend layer (ECR, IAM, internal ALB, ECS) | ⬜ |
 | 6 | Security groups between the VPCs (user decision) | ⬜ |
@@ -76,6 +76,50 @@ docker rm -f adom-backend-test
 ```
 Results: health OK (14 quotes), 30 calls → 11 different quotes, 404 JSON, runs as `appuser`,
 writes blocked, missing quotes file → container exits with code 1.
+
+### Frontend (Phase 2 Step 2)
+
+The Phase 1 app moved to `app/frontend/` (`git mv`, history kept) and now calls the backend.
+
+| Endpoint | Returns |
+|---|---|
+| `GET /` | Page: blue **Frontend (VPC A)** box, green **Backend (VPC B)** box (from `served_by`), "✔ Backend call OK – N ms", the quote, **New quote** button. Backend failure → red **Backend unreachable** box + error; page still loads |
+| `GET /api/status` | Same data as JSON: `{"frontend": {...}, "backend": {"ok", "data" \| "error", "elapsed_ms"}}` (for tests / deploy script) |
+| `GET /api/whoami` | Frontend container info |
+| `GET /health` | `{"status": "ok"}` – **never calls the backend** |
+
+- Config: `BACKEND_URL` (in AWS: internal ALB DNS name; locally `http://backend:8080`),
+  `BACKEND_TIMEOUT` (default `2` s), `APP_NAME`, `APP_ENV`.
+- **`/health` independent of the backend:** otherwise a backend outage would make the public ALB mark
+  every frontend task unhealthy and replace them → a partial outage becomes a full one (cascading failure).
+- **One deadline for the whole backend call (DNS included):** `urlopen(timeout=...)` covers connect/read
+  but **not the DNS lookup** – measured ~4 s with the backend stopped. The call now runs in a small
+  `ThreadPoolExecutor` and `future.result(timeout=2)` bounds everything → every failure ≈ 2 s.
+- Jinja autoescaping on: quote text is HTML-escaped (matters once quotes become editable in bonus B3).
+- The 👍 Like button is **bonus B2** (not in core).
+
+### Run both locally – `docker compose` (from the project root)
+
+`docker-compose.yml` mirrors AWS: only the **frontend** is published (`localhost:8080`); the **backend
+has no published port**, reachable only from the frontend (like VPC B). Both run with the ECS hardening
+(`read_only`, `cap_drop: [ALL]`, `no-new-privileges`, `linux/amd64`).
+
+```powershell
+docker compose up --build -d          # start both, open http://localhost:8080
+docker compose stop backend           # refresh → red "Backend unreachable" after ~2 s
+docker compose start backend          # refresh → green again
+docker compose pause backend          # refresh → "Timeout: no answer within 2 s"
+docker compose unpause backend
+curl.exe http://localhost:8082/health # fails: backend is private
+curl.exe http://localhost:8080/api/status
+docker compose logs frontend          # warnings for failed backend calls
+docker compose down                   # stop + remove
+```
+
+Results (2026-10-14): page shows both boxes + quote; 20 loads → 11 different quotes; backend not
+reachable from host; backend stopped → page 200 in 2.07 s (red box); frozen → 2.05 s ("Timeout");
+recovery 10/10 OK; frontend `/health` stays OK while backend is down; both containers `appuser`,
+read-only, caps dropped. UI checked by the user in the browser.
 
 ## Progress
 
@@ -202,12 +246,10 @@ The manual commands the script runs are in **"Deploy from scratch"** below (for 
 │   └── deploy.ps1          # one-command deploy / destroy (see "Quick start")
 ├── tests/
 │   └── egress-test.json    # one-off ECS task override: proves tasks cannot reach the internet
+├── docker-compose.yml      # run frontend + backend locally (backend not published, like VPC B)
 ├── app/
-│   ├── app.py              # Flask app: shows hostname, IP, ECS task ID & AZ (Phase 1 frontend;
-│   ├── requirements.txt    #   moves to app/frontend/ in Phase 2 Step 2)
-│   ├── Dockerfile
-│   ├── .dockerignore
-│   └── backend/            # Phase 2 backend API: app.py, quotes.txt, requirements.txt, Dockerfile
+│   ├── frontend/           # public web page: app.py, requirements.txt, Dockerfile, .dockerignore
+│   └── backend/            # private API: app.py, quotes.txt, requirements.txt, Dockerfile
 └── terraform/
     ├── providers.tf        # Terraform/provider version pins, default_tags, S3 backend (commented)
     ├── variables.tf        # typed + validated input variables
@@ -265,7 +307,7 @@ $REPO = terraform output -raw ecr_repository_url
 $REGISTRY = $REPO.Split('/')[0]
 # Pipe through cmd: PowerShell 5.1 re-encodes piped text and corrupts the token (-> 400 Bad Request)
 cmd /c "aws ecr get-login-password --region eu-central-1 | docker login --username AWS --password-stdin $REGISTRY"
-docker build --platform linux/amd64 --provenance=false --sbom=false -t "${REPO}:v1.0.0" ../app
+docker build --platform linux/amd64 --provenance=false --sbom=false -t "${REPO}:v1.0.0" ../app/frontend
 docker push "${REPO}:v1.0.0"
 ```
 
@@ -327,7 +369,7 @@ Type the URL with `http://` explicitly.
 Real-world: ECR in a separate long-lived "foundation" stack; CI/CD pushes a tag then applies with
 `-var image_tag=...`. `-target` is only for this bootstrap, not routine use.
 
-## The app
+## The app (Phase 1 – now `app/frontend/`, extended in Phase 2 Step 2)
 
 | Endpoint | Purpose |
 |---|---|
@@ -338,14 +380,8 @@ Real-world: ECR in a separate long-lived "foundation" stack; CI/CD pushes a tag 
 ECS details come from the Task Metadata Endpoint v4 (`ECS_CONTAINER_METADATA_URI_V4`).
 Locally they are omitted and `Environment` shows `local`.
 
-### Run locally
-
-```powershell
-docker build -t adom-demo:local ./app
-docker run -d --name adom-demo-test -p 8080:8080 -e APP_NAME="Adom Demo" adom-demo:local
-# open http://localhost:8080
-docker rm -f adom-demo-test
-```
+To run it locally use `docker compose` (see "Run both locally" in the Phase 2 section). Without a
+backend the page still loads and shows "Backend unreachable – BACKEND_URL is not set".
 
 ## Key architectural decisions
 
