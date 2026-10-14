@@ -36,8 +36,8 @@ routes in private route tables only; second ECR repo / IAM role / log group / in
 (DynamoDB or S3) · B2 👍 Like button → log line → metric filter → CloudWatch alarm (+ optional email)
 · B3 edit a quote from the frontend (input + Save) and backend API (`PUT /api/quotes/<id>`).
 
-**Open decisions:** Step 6 – security between the VPCs (network only vs. network + API key);
-Bonus – DynamoDB vs. S3, email yes/no.
+**Decided:** Step 6 – security between the VPCs = **network only** (SG-to-SG rules, no API key).
+**Open decisions:** Bonus – DynamoDB vs. S3, email yes/no.
 
 | Step | What | Status |
 |---|---|---|
@@ -45,8 +45,8 @@ Bonus – DynamoDB vs. S3, email yes/no.
 | 2 | Frontend app update (backend call, quote box, graceful degradation) + `docker compose` | ✅ Done – tested locally with `docker compose`, UI checked by user |
 | 3 | Make modules reusable (network w/o public subnets, internal ALB, flexible ECS) – Phase 1 plan must show no changes | ✅ Done – plan identical to Phase 1 (only 3 intended address moves), new options proven with a test config |
 | 4 | VPC B + peering + routes | ✅ Done – plan only (57 to add); Phase 1 resources identical; overlap check proven |
-| 5 | Backend layer (ECR, IAM, internal ALB, ECS) | ⏳ Next |
-| 6 | Security groups between the VPCs (user decision) | ⬜ |
+| 5 | Backend layer (ECR, IAM, internal ALB, ECS) | ✅ Done – plan only (75 to add); Phase 1 resources renamed to `frontend` |
+| 6 | Security groups between the VPCs (network only) | ⏳ Next |
 | 7 | `deploy.ps1` for 2 images | ⬜ |
 | 8 | Full deploy + tests | ⬜ |
 
@@ -198,6 +198,47 @@ internal ALB `internal = true`; SG ingress + extra egress rules; `BACKEND_URL` i
 
 Note: those blocked plans are **intentional negative tests** (`-var vpc_b_cidr=...`); the real
 tfvars plan is clean (exit code 0).
+
+### Backend layer (Phase 2 Step 5)
+
+The same 4 modules (ecr, iam, alb, ecs) + a log group are now used **once per layer**:
+
+| | Frontend (VPC A) | Backend (VPC B) |
+|---|---|---|
+| Root modules | `ecr_frontend`, `iam_frontend`, `alb_frontend`, `ecs_frontend` | `ecr_backend`, `iam_backend`, `alb_backend`, `ecs_backend` |
+| ECR repo | `adom-demo-dev-frontend` | `adom-demo-dev-backend` |
+| Log group | `/ecs/adom-demo-dev/frontend` | `/ecs/adom-demo-dev/backend` |
+| IAM roles | `adom-demo-dev-frontend-ecs-execution-role` / `-task-role` | `adom-demo-dev-backend-ecs-execution-role` / `-task-role` |
+| ALB | `adom-demo-dev-frontend-alb` – **public**, public subnets | `adom-demo-dev-backend-alb` – **internal**, private subnets |
+| ECS | `adom-demo-dev-frontend-cluster`, service `adom-demo-dev-frontend-app` | `adom-demo-dev-backend-cluster`, service `adom-demo-dev-backend-app` |
+| Image tag (tfvars) | `frontend_image_tag` | `backend_image_tag` |
+
+- **Phase 1 names renamed** (`adom-demo-dev-app` → `adom-demo-dev-frontend`, `adom-demo-dev-alb` →
+  `adom-demo-dev-frontend-alb`, ...). The environment was destroyed, so the rename cost nothing.
+  The Phase 1 sections below still show the old names (history).
+- **`BACKEND_URL`** for the frontend = `http://<internal ALB DNS name>`. The name is public DNS but
+  resolves to **private IPs in VPC B** → reachable only over the peering.
+- **Least privilege per layer:** each execution role can pull only its own repo and write only its own
+  log group. A hacked frontend can't pull the backend image or write backend logs.
+- **Two image tags:** frontend and backend get new versions independently.
+- `task_cpu` / `task_memory` / `desired_count` are shared by both services (2 tasks each, 1a + 1b).
+- New outputs: `backend_url`, `frontend_/backend_ecr_repository_url`, `..._log_group_name`,
+  `..._ecs_cluster_name`, `..._ecs_service_name`, `frontend_tasks_security_group_id`,
+  `backend_alb_security_group_id`. (`ecr_repository_url`, `log_group_name`, IAM role ARN outputs removed.)
+- After Step 5 the internal ALB has **no ingress rule** → nobody can call it yet (Step 6).
+- **`scripts/deploy.ps1` is broken until Step 7** (still uses `module.ecr`, `image_tag`, `ecr_repository_url`).
+
+**Tests (plan only, 2026-10-14):**
+
+| Test | Result |
+|---|---|
+| Plan | 75 to add = 57 (Step 4) + 18 backend (ECR 2, log group 1, IAM 3, ALB 4, ECS 8) |
+| Names | All 18 correct; longest IAM role 41/64 chars, longest ALB name 26/32 |
+| Internal ALB | `internal = true`, no ingress rule; only the public ALB has `0.0.0.0/0` |
+| Wiring (`terraform graph`, followed all edges) | Frontend task def depends on `alb_backend` (= `BACKEND_URL`) + its own ECR/IAM. Backend uses only `network_backend`, `ecr_backend`, `iam_backend`, `alb_backend` – never VPC A |
+
+Task definitions show `container_definitions = (known after apply)` in the plan (the ECR URL doesn't
+exist yet), so the wiring was proven with the dependency graph instead.
 
 ### Interview notes: Terraform `for_each` keys
 
@@ -644,6 +685,8 @@ aws iam simulate-principal-policy --policy-source-arn <execution-role-arn> --act
   rebuilding once Debian ships patches, or add `apt-get upgrade` in the Dockerfile.
 - **Environment is currently destroyed** (cost saving). Recreate with `.\scripts\deploy.ps1`
   (`ecr_force_delete = true` deleted the image with the repo; the script pushes it again).
+- **`scripts/deploy.ps1` doesn't work on branch `Phase2` yet** – old module/variable/output names;
+  rewritten for 2 images in Phase 2 Step 7.
 - **`scripts/deploy.ps1` deploy path not yet run end to end** – only its `-Destroy` path (on empty
   state) and helper functions were tested. Parse check passed on Windows PowerShell 5.1.
 - **HTTPS:** HTTP-only for the demo. Production: ACM certificate + 443 listener + 80→443 redirect.
@@ -666,9 +709,10 @@ aws iam simulate-principal-policy --policy-source-arn <execution-role-arn> --act
 | `alb_ingress_cidrs` | `["0.0.0.0/0"]` (public demo) |
 | `enable_container_insights` | `false` |
 | `container_port` | `8080` |
-| `image_tag` | `v1.0.0` (immutable – bump per build) |
-| `task_cpu` / `task_memory` | `256` / `512` |
-| `desired_count` | `2` (one task per AZ) |
+| `vpc_b_cidr` / `vpc_b_private_subnet_cidrs` | `10.20.0.0/16` / `10.20.11.0/24`, `10.20.12.0/24` |
+| `frontend_image_tag` / `backend_image_tag` | `v1.0.0` / `v1.0.0` (immutable – bump per build; was `image_tag` in Phase 1) |
+| `task_cpu` / `task_memory` | `256` / `512` (per task, both services) |
+| `desired_count` | `2` per service (one task per AZ) |
 
 ## Working conventions
 

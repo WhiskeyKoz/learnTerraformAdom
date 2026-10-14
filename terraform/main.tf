@@ -3,10 +3,10 @@
 #   module "network_frontend" - VPC A: public + private subnets, IGW, endpoints
 #   module "network_backend"  - VPC B: private subnets only, no IGW, endpoints
 #   module "peering"          - VPC A <-> VPC B + routes (private RTs only)
-#   module "ecr"              - image repository
-#   module "iam"              - task execution role + task role (+ app log group here)
-#   module "alb"              - public ALB, target group, listener
-#   module "ecs"              - cluster, task definition, service
+#
+# Then the same 4 modules once per layer (+ a log group in this file):
+#   frontend (VPC A): ecr_frontend, iam_frontend, alb_frontend (public),   ecs_frontend
+#   backend  (VPC B): ecr_backend,  iam_backend,  alb_backend  (internal), ecs_backend
 # ---------------------------------------------------------------------------
 
 locals {
@@ -66,39 +66,46 @@ module "peering" {
   accepter_route_tables = { private = module.network_backend.private_route_table_id }
 }
 
-module "ecr" {
+# ===========================================================================
+# FRONTEND layer - VPC A (public web page)
+#   Browser -> public ALB (public subnets) -> frontend tasks (private subnets)
+# ===========================================================================
+
+module "ecr_frontend" {
   source = "./modules/ecr"
 
   name_prefix     = local.name_prefix
+  repository_name = "frontend"
   force_delete    = var.ecr_force_delete
   max_image_count = var.ecr_max_image_count
 }
 
-# Log group for the app containers. Lives in the root module because two
-# modules depend on it: iam (scopes write permissions to it) and ecs
-# (points the awslogs driver at it). Creating it in Terraform - instead of
-# letting ECS auto-create it - means a set retention period and no
-# logs:CreateLogGroup permission at runtime.
-resource "aws_cloudwatch_log_group" "app" {
-  name              = "/ecs/${local.name_prefix}/app"
+# Log groups live in the root module because two modules depend on each one:
+# iam (scopes write permissions to it) and ecs (points the awslogs driver at
+# it). Creating them in Terraform - instead of letting ECS auto-create them -
+# means a set retention period and no logs:CreateLogGroup permission at runtime.
+resource "aws_cloudwatch_log_group" "frontend" {
+  name              = "/ecs/${local.name_prefix}/frontend"
   retention_in_days = var.log_retention_days
 
-  tags = { Name = "${local.name_prefix}-app-logs" }
+  tags = { Name = "${local.name_prefix}-frontend-logs" }
 }
 
-module "iam" {
+module "iam_frontend" {
   source = "./modules/iam"
 
   name_prefix        = local.name_prefix
+  component          = "frontend"
   aws_region         = var.aws_region
-  ecr_repository_arn = module.ecr.repository_arn
-  log_group_arn      = aws_cloudwatch_log_group.app.arn
+  ecr_repository_arn = module.ecr_frontend.repository_arn
+  log_group_arn      = aws_cloudwatch_log_group.frontend.arn
 }
 
-module "alb" {
+module "alb_frontend" {
   source = "./modules/alb"
 
   name_prefix       = local.name_prefix
+  component         = "frontend"
   vpc_id            = module.network_frontend.vpc_id
   subnet_ids        = module.network_frontend.public_subnet_ids
   ingress_cidrs     = var.alb_ingress_cidrs
@@ -106,10 +113,11 @@ module "alb" {
   health_check_path = var.health_check_path
 }
 
-module "ecs" {
+module "ecs_frontend" {
   source = "./modules/ecs"
 
   name_prefix = local.name_prefix
+  component   = "frontend"
   aws_region  = var.aws_region
   environment = var.environment
 
@@ -117,16 +125,97 @@ module "ecs" {
   private_subnet_ids              = module.network_frontend.private_subnet_ids
   vpc_endpoints_security_group_id = module.network_frontend.vpc_endpoints_security_group_id
   s3_prefix_list_id               = module.network_frontend.s3_prefix_list_id
-  alb_security_group_id           = module.alb.alb_security_group_id
-  target_group_arn                = module.alb.target_group_arn
+  alb_security_group_id           = module.alb_frontend.alb_security_group_id
+  target_group_arn                = module.alb_frontend.target_group_arn
 
-  container_image    = "${module.ecr.repository_url}:${var.image_tag}"
+  container_image    = "${module.ecr_frontend.repository_url}:${var.frontend_image_tag}"
   container_port     = var.container_port
   task_cpu           = var.task_cpu
   task_memory        = var.task_memory
-  execution_role_arn = module.iam.execution_role_arn
-  task_role_arn      = module.iam.task_role_arn
-  log_group_name     = aws_cloudwatch_log_group.app.name
+  execution_role_arn = module.iam_frontend.execution_role_arn
+  task_role_arn      = module.iam_frontend.task_role_arn
+  log_group_name     = aws_cloudwatch_log_group.frontend.name
+
+  # The frontend finds the backend through the internal ALB's DNS name.
+  # The name is public DNS but resolves to PRIVATE IPs in VPC B - reachable
+  # only over the peering. Security group rules to allow it: Step 6.
+  environment_variables = {
+    BACKEND_URL = "http://${module.alb_backend.alb_dns_name}"
+  }
+
+  desired_count             = var.desired_count
+  enable_container_insights = var.enable_container_insights
+}
+
+# ===========================================================================
+# BACKEND layer - VPC B (private API, no internet)
+#   frontend tasks --peering--> internal ALB (private subnets) -> backend tasks
+# ===========================================================================
+
+module "ecr_backend" {
+  source = "./modules/ecr"
+
+  name_prefix     = local.name_prefix
+  repository_name = "backend"
+  force_delete    = var.ecr_force_delete
+  max_image_count = var.ecr_max_image_count
+}
+
+resource "aws_cloudwatch_log_group" "backend" {
+  name              = "/ecs/${local.name_prefix}/backend"
+  retention_in_days = var.log_retention_days
+
+  tags = { Name = "${local.name_prefix}-backend-logs" }
+}
+
+# Own roles: the backend execution role can pull ONLY the backend image and
+# write ONLY the backend log group (and the frontend role only its own).
+module "iam_backend" {
+  source = "./modules/iam"
+
+  name_prefix        = local.name_prefix
+  component          = "backend"
+  aws_region         = var.aws_region
+  ecr_repository_arn = module.ecr_backend.repository_arn
+  log_group_arn      = aws_cloudwatch_log_group.backend.arn
+}
+
+# Internal ALB: private IPs only, in VPC B's private subnets. No ingress
+# rule yet - who may call it (the frontend tasks) is decided in Step 6.
+module "alb_backend" {
+  source = "./modules/alb"
+
+  name_prefix       = local.name_prefix
+  component         = "backend"
+  internal          = true
+  vpc_id            = module.network_backend.vpc_id
+  subnet_ids        = module.network_backend.private_subnet_ids
+  container_port    = var.container_port
+  health_check_path = var.health_check_path
+}
+
+module "ecs_backend" {
+  source = "./modules/ecs"
+
+  name_prefix = local.name_prefix
+  component   = "backend"
+  aws_region  = var.aws_region
+  environment = var.environment
+
+  vpc_id                          = module.network_backend.vpc_id
+  private_subnet_ids              = module.network_backend.private_subnet_ids
+  vpc_endpoints_security_group_id = module.network_backend.vpc_endpoints_security_group_id
+  s3_prefix_list_id               = module.network_backend.s3_prefix_list_id
+  alb_security_group_id           = module.alb_backend.alb_security_group_id
+  target_group_arn                = module.alb_backend.target_group_arn
+
+  container_image    = "${module.ecr_backend.repository_url}:${var.backend_image_tag}"
+  container_port     = var.container_port
+  task_cpu           = var.task_cpu
+  task_memory        = var.task_memory
+  execution_role_arn = module.iam_backend.execution_role_arn
+  task_role_arn      = module.iam_backend.task_role_arn
+  log_group_name     = aws_cloudwatch_log_group.backend.name
 
   desired_count             = var.desired_count
   enable_container_insights = var.enable_container_insights

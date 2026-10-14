@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-# Phase 1 configuration. Change values here - not in the .tf files.
+# Configuration (Phase 1 + Phase 2). Change values here - not in the .tf files.
 # This file contains NO secrets and is committed on purpose.
 # ---------------------------------------------------------------------------
 
@@ -29,12 +29,13 @@ ecr_max_image_count = 10
 log_retention_days = 7
 
 # Application / ECS
-container_port    = 8080
-image_tag         = "v1.0.0" # tags are immutable - bump for every new build
-task_cpu          = 256
-task_memory       = 512
-desired_count     = 2
-health_check_path = "/health"
+container_port     = 8080
+frontend_image_tag = "v1.0.0" # tags are immutable - bump for every new build
+backend_image_tag  = "v1.0.0" # versioned separately from the frontend
+task_cpu           = 256      # per task, frontend and backend
+task_memory        = 512
+desired_count      = 2 # per service: one task per AZ
+health_check_path  = "/health"
 
 enable_container_insights = false # extra CloudWatch cost; enable when you need per-task metrics
 

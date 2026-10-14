@@ -131,14 +131,24 @@ variable "container_port" {
   default     = 8080
 }
 
-variable "image_tag" {
-  description = "Tag of the image in ECR to deploy (e.g. v1.0.0 or a git SHA)."
+variable "frontend_image_tag" {
+  description = "Tag of the frontend image in ECR to deploy (e.g. v1.0.0 or a git SHA)."
   type        = string
 
   # Tags are immutable in ECR, so a moving tag like "latest" would make
   # every push after the first one fail.
   validation {
-    condition     = var.image_tag != "latest"
+    condition     = var.frontend_image_tag != "latest"
+    error_message = "Use a versioned tag (e.g. v1.0.0 or a git SHA), not \"latest\"."
+  }
+}
+
+variable "backend_image_tag" {
+  description = "Tag of the backend image in ECR to deploy. Versioned separately from the frontend."
+  type        = string
+
+  validation {
+    condition     = var.backend_image_tag != "latest"
     error_message = "Use a versioned tag (e.g. v1.0.0 or a git SHA), not \"latest\"."
   }
 }
@@ -156,7 +166,7 @@ variable "task_memory" {
 }
 
 variable "desired_count" {
-  description = "Number of ECS tasks to run. Use >= 2 so both AZs get a task."
+  description = "Number of ECS tasks per service (frontend and backend). Use >= 2 so both AZs get a task."
   type        = number
   default     = 2
 }

@@ -35,40 +35,64 @@ output "peering_connection_id" {
   value       = module.peering.peering_connection_id
 }
 
-# --- ECR -------------------------------------------------------------------
-output "ecr_repository_url" {
-  description = "Push the app image here: docker push <url>:<image_tag>"
-  value       = module.ecr.repository_url
-}
-
-# --- Logging / IAM ---------------------------------------------------------
-output "log_group_name" {
-  description = "CloudWatch log group for the app containers."
-  value       = aws_cloudwatch_log_group.app.name
-}
-
-output "ecs_execution_role_arn" {
-  description = "ECS task execution role (image pull + logs)."
-  value       = module.iam.execution_role_arn
-}
-
-output "ecs_task_role_arn" {
-  description = "ECS task role (app runtime identity)."
-  value       = module.iam.task_role_arn
-}
-
-# --- ALB / ECS -------------------------------------------------------------
+# --- Frontend layer (VPC A) -------------------------------------------------
 output "app_url" {
   description = "Open this in a browser - refresh to see requests hit tasks in both AZs."
-  value       = "http://${module.alb.alb_dns_name}"
+  value       = "http://${module.alb_frontend.alb_dns_name}"
 }
 
-output "ecs_cluster_name" {
-  description = "ECS cluster name."
-  value       = module.ecs.cluster_name
+output "frontend_ecr_repository_url" {
+  description = "Push the frontend image here: docker push <url>:<frontend_image_tag>"
+  value       = module.ecr_frontend.repository_url
 }
 
-output "ecs_service_name" {
-  description = "ECS service name."
-  value       = module.ecs.service_name
+output "frontend_log_group_name" {
+  description = "CloudWatch log group for the frontend containers."
+  value       = aws_cloudwatch_log_group.frontend.name
+}
+
+output "frontend_ecs_cluster_name" {
+  description = "Frontend ECS cluster name."
+  value       = module.ecs_frontend.cluster_name
+}
+
+output "frontend_ecs_service_name" {
+  description = "Frontend ECS service name."
+  value       = module.ecs_frontend.service_name
+}
+
+output "frontend_tasks_security_group_id" {
+  description = "Security group of the frontend tasks (the source the backend ALB will allow in Step 6)."
+  value       = module.ecs_frontend.tasks_security_group_id
+}
+
+# --- Backend layer (VPC B) --------------------------------------------------
+output "backend_url" {
+  description = "Internal ALB URL - resolves to private IPs in VPC B, NOT reachable from the internet. The frontend gets it as BACKEND_URL."
+  value       = "http://${module.alb_backend.alb_dns_name}"
+}
+
+output "backend_ecr_repository_url" {
+  description = "Push the backend image here: docker push <url>:<backend_image_tag>"
+  value       = module.ecr_backend.repository_url
+}
+
+output "backend_log_group_name" {
+  description = "CloudWatch log group for the backend containers."
+  value       = aws_cloudwatch_log_group.backend.name
+}
+
+output "backend_ecs_cluster_name" {
+  description = "Backend ECS cluster name."
+  value       = module.ecs_backend.cluster_name
+}
+
+output "backend_ecs_service_name" {
+  description = "Backend ECS service name."
+  value       = module.ecs_backend.service_name
+}
+
+output "backend_alb_security_group_id" {
+  description = "Security group of the internal ALB."
+  value       = module.alb_backend.alb_security_group_id
 }
