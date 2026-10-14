@@ -1,0 +1,18 @@
+# One quote per line:  text | author
+# Lines starting with # and empty lines are ignored.
+# To add a quote: add a line, build a new image tag, deploy.
+
+Simplicity is prerequisite for reliability. | Edsger W. Dijkstra
+Talk is cheap. Show me the code. | Linus Torvalds
+Programs must be written for people to read, and only incidentally for machines to execute. | Harold Abelson
+Make it work, make it right, make it fast. | Kent Beck
+First, solve the problem. Then, write the code. | John Johnson
+Premature optimization is the root of all evil. | Donald Knuth
+Everything fails, all the time. | Werner Vogels
+Any fool can write code that a computer can understand. Good programmers write code that humans can understand. | Martin Fowler
+The best way to predict the future is to invent it. | Alan Kay
+There are only two hard things in Computer Science: cache invalidation and naming things. | Phil Karlton
+Walking on water and developing software from a specification are easy if both are frozen. | Edward V. Berard
+Code is like humor. When you have to explain it, it's bad. | Cory House
+Deleted code is debugged code. | Jeff Sickel
+Simplicity is the soul of efficiency. | R. Austin Freeman

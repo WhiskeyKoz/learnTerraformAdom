@@ -15,7 +15,67 @@ Single VPC: 2 public + 2 private subnets across 2 AZs, ALB in public subnets,
 ECS Fargate service in private subnets, image in ECR, least-privilege IAM.
 Deployed and verified end to end (40 resources), then destroyed to save cost.
 
-**Next: Phase 2** – multi-VPC (VPC B internal backend) + VPC peering. Not started.
+## Phase 2 – 🚧 IN PROGRESS (branch `Phase2`, full plan in `phase2.txt`)
+
+**Goal:** the user opens the **frontend** (VPC A, public ALB). The frontend calls the **backend API**
+in a second, **isolated VPC B with no internet**, through an **internal ALB over VPC peering**. The page
+shows info from both sides plus a **random quote** from the backend – proving traffic crossed the peering.
+
+```
+ Browser ──http──▶ Public ALB ──▶ FRONTEND (VPC A 10.10.0.0/16, AZ 1a+1b)
+                                     │ GET /api/quote
+                                     ▼  VPC Peering
+                   Internal ALB ──▶ BACKEND API (VPC B 10.20.0.0/16, AZ 1a+1b, no internet)
+```
+
+**Core (building now):** backend API with random quotes from `app/backend/quotes.txt`; frontend shows
+frontend box + backend box + quote, survives backend failure (2s timeout); VPC B private-only; peering
+routes in private route tables only; second ECR repo / IAM role / log group / internal ALB / ECS service.
+
+**Bonus (only when the user says so, after core is done):** B1 quotes + like counts in a DB
+(DynamoDB or S3) · B2 👍 Like button → log line → metric filter → CloudWatch alarm (+ optional email)
+· B3 edit a quote from the frontend (input + Save) and backend API (`PUT /api/quotes/<id>`).
+
+**Open decisions:** Step 6 – security between the VPCs (network only vs. network + API key);
+Bonus – DynamoDB vs. S3, email yes/no.
+
+| Step | What | Status |
+|---|---|---|
+| 1 | Backend app (`app/backend`: API, `quotes.txt`, Dockerfile) | ✅ Done – tested locally in Docker |
+| 2 | Frontend app update (backend call, quote box, graceful degradation) + `docker compose` | ⏳ Next |
+| 3 | Make modules reusable (network w/o public subnets, internal ALB, flexible ECS) – Phase 1 plan must show no changes | ⬜ |
+| 4 | VPC B + peering + routes | ⬜ |
+| 5 | Backend layer (ECR, IAM, internal ALB, ECS) | ⬜ |
+| 6 | Security groups between the VPCs (user decision) | ⬜ |
+| 7 | `deploy.ps1` for 2 images | ⬜ |
+| 8 | Full deploy + tests | ⬜ |
+
+### Backend API (Phase 2 Step 1)
+
+| Endpoint | Returns |
+|---|---|
+| `GET /api/quote` | `{"quote": {id, text, author}, "served_by": {Hostname, Private IP, Task ID, AZ, ...}}` – random each call |
+| `GET /api/whoami` | Backend container info |
+| `GET /health` | `{"status": "ok", "quotes_loaded": N}` (internal ALB health check) |
+| anything else | `{"error": "not found"}`, 404 |
+
+- `quotes.txt`: one quote per line `text | author`; `#` comments and blank lines ignored. Baked into the
+  image (VPC B has no internet). Add a quote → new image tag → deploy.
+- Quotes load **once at start-up**; a broken/missing file makes the container exit immediately
+  (fail fast) instead of failing every request. `QUOTES_FILE` env var overrides the path.
+- `served_by` in `/api/quote` lets the frontend fill the backend box from the **same** call.
+- Same hardening as the frontend: non-root UID 10001, read-only root FS ready (`/dev/shm`), port 8080.
+
+Local test (passed 2026-10-14, run with `--read-only --cap-drop ALL --security-opt no-new-privileges`):
+```powershell
+docker build --platform linux/amd64 --provenance=false --sbom=false -t adom-backend:local ./app/backend
+docker run -d --name adom-backend-test --read-only --cap-drop ALL -p 8082:8080 adom-backend:local
+curl.exe http://localhost:8082/api/quote      # random quote + served_by
+curl.exe http://localhost:8082/health         # {"quotes_loaded":14,"status":"ok"}
+docker rm -f adom-backend-test
+```
+Results: health OK (14 quotes), 30 calls → 11 different quotes, 404 JSON, runs as `appuser`,
+writes blocked, missing quotes file → container exits with code 1.
 
 ## Progress
 
@@ -137,15 +197,17 @@ The manual commands the script runs are in **"Deploy from scratch"** below (for 
 ```
 .
 ├── CLAUDE.md
+├── phase2.txt              # Phase 2 plan (core + bonus)
 ├── scripts/
 │   └── deploy.ps1          # one-command deploy / destroy (see "Quick start")
 ├── tests/
 │   └── egress-test.json    # one-off ECS task override: proves tasks cannot reach the internet
 ├── app/
-│   ├── app.py              # Flask app: shows hostname, IP, ECS task ID & AZ
-│   ├── requirements.txt    # flask, gunicorn (pinned)
+│   ├── app.py              # Flask app: shows hostname, IP, ECS task ID & AZ (Phase 1 frontend;
+│   ├── requirements.txt    #   moves to app/frontend/ in Phase 2 Step 2)
 │   ├── Dockerfile
-│   └── .dockerignore
+│   ├── .dockerignore
+│   └── backend/            # Phase 2 backend API: app.py, quotes.txt, requirements.txt, Dockerfile
 └── terraform/
     ├── providers.tf        # Terraform/provider version pins, default_tags, S3 backend (commented)
     ├── variables.tf        # typed + validated input variables
